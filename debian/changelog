@@ -1,0 +1,9 @@
+loopcatcher (0.1-1) unstable; urgency=medium
+
+  * First release as loopcatcher.
+  * Generic loopback audio capture positioning and documentation.
+  * Keep sink default name as "spotify" for compatibility.
+  * Interactive TUI with runtime config menu and session output handling.
+  * Debian packaging metadata and desktop integration.
+
+ -- loopcatcher maintainers <maintainers@example.com>  Thu, 27 Aug 2026 12:00:00 +0000

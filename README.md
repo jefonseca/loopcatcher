@@ -1,91 +1,78 @@
-# spotifyripper
-A bash script to record music from Spotify to **acc** or **ogg** files
+# loopcatcher
+Generic Linux audio loopback capture tool for recording app/system playback to AAC or OGG.
+
+## Highlights
+- Focused on loopback technology (PulseAudio/PipeWire monitor sink capture), not any specific platform.
+- Interactive TUI for session setup, live status, and runtime config edits.
+- Per-session output folders (`output_directory/session_name`) to avoid accidental overwrite.
+- XDG config support at `~/.config/loopcatcher/config`.
+- Debian packaging metadata and GitHub Actions workflow for release artifacts.
+
+Current version: `0.1`
 
 ## Dependencies
-* [Spotify client](https://www.spotify.com/ec/download/linux/)
-* fdkaac
-* oggenc (usually in vorbis-tools)
+- `pactl` (PulseAudio or PipeWire with pulse compatibility)
+- `dbus-monitor`
+- `parec`
+- `fdkaac`
+- `oggenc` (`vorbis-tools`)
 
-## Installation
-1. Clone this repository or download the file spotifyripper.sh
-2. Make shure that the file is executable
+## Quick start
 ```bash
-chmod +x spotifyripper.sh
+chmod +x loopcatcher
+./loopcatcher
 ```
-3. Disable the autoplay feature in the Spotify client. That is nessesary for the script to know when to stop recording
-4. Play anything in spotify to create the pulseaudio sink for the first time
-5. Execute the script ```./spotifyripper.sh```
-6. Optinal: Install any missing dependencies. For exemple in debian/ubuntu ```sudo apt install fdkaac vorbis-tools``` and repeat the step 5
 
-**Recommended steps:**
-1. Use a Spotify Premium account. I have made all the testing with a premium account.
-2. Is better if you use a virtual machine or a dedicated computer to let Spotify run while you record. Some DE tend to switch to the null audio output al all applications
-3. Disable the sound of the notifications on your DE
-4. Do not use any application that could use sound while recording
-5. Create a "bin" directory in your home directory and copy the script there to be able to execute the script in any path.
+You can provide runtime overrides:
 ```bash
-mkdir ~/bin
-cp spotifyripper.sh ~/bin
+./loopcatcher --output /path/to/output --session my-session
 ```
-6. To record first go to the destination directory and then execute the script
+
+## TUI controls
+- `c` open config menu
+- `r` reload config from disk
+- `Ctrl+C` exit safely
+
+When playback switches to pause/stop, the session ends and the TUI waits with `Press any key to exit`.
+
+## Configuration
+- Config path: `~/.config/loopcatcher/config`
+- Override config path with `--config /path/to/config`
+
+Main keys:
+- `record_format` (`aac` or `ogg`)
+- `bitrate`
+- `aac_profile`
+- `filename_scheme` (`normal`, `strict`, `strict-lc-nodir`)
+- `output_directory`
+- `sink_app_name` (app sink name to target; default keeps `spotify`)
+- `nulloutput_name`
+- `debug`
+
+## CLI options
+```text
+--help                    Show help
+--version                 Show version
+--debug                   Enable debug
+--output <dir>            Output directory
+--session <name>          Session name override
+--format <format>         Record format: aac or ogg
+--aac-profile <id>        AAC profile (aac only)
+--bitrate <kbps>          Bitrate target
+--scheme <scheme>         Filename scheme
+--config <path>           Config path override
+--no-intro                Skip startup intro screen
+```
+
+Validation notes:
+- `--format` only accepts `aac` or `ogg`
+- `--scheme` only accepts `normal`, `strict`, `strict-lc-nodir`
+- `--bitrate` and `--aac-profile` must be positive integers
+
+## Build .deb package
 ```bash
-cd Music
-spotifyripper.sh
-```
-## Options
-All are optional. 
-You can give as first argument the destination directory. It defaults to the same directory that the script is called.
-Copy the file spotifyripper.conf.example to spotifyripper.conf and keep it in the same directory as the script.
-```bash	
-cp spotifyripper.conf.example spotifyripper.conf
+dpkg-buildpackage -us -uc -b
 ```
 
-This are the options avaliable:
-
-### Audio coding format
-
-Posible values: "aac" or "ogg"
-
-Example:
-```bash
-recordformat="ogg"
-```
-
-Default: "aac"
-
-### AAC profile for fdkaac
-Only aplies to the aac format. Ignored when ogg is used
-
-Posible values: Any supported by [fdkaac](https://manpages.debian.org/stretch/fdkaac/fdkaac.1.en.html)
-
-Example:
-```bash
-aac_profile="5"
-```
-
-Default: "29"
-
-### Bit rate
-Posible values: Any supported by [fdkaac](https://manpages.debian.org/buster/fdkaac/fdkaac.1.en.html) or [oggenc](https://manpages.debian.org/buster/vorbis-tools/oggenc.1.en.html)
-
-Example:
-```bash
-bitrate="192"
-```
-
-Default: "48"
-
-### File name scheme
-Set the output file name / directory scheme
-
-Posible values: 
-* "normal" : Based on Artist / Album / Tittle
-* "strict" : Based on Artist / Album / Tittle removing all special characters
-* "strict-lc-nodir" : Creates no directory structure. It removes the special characters and converts to lower case the filename
-
-Example:
-```bash
-filenamescheme="normal"
-```
-
-Default: "normal  "
+## Disclaimer
+This tool is intended for educational and operational use on audio sources you are legally allowed to capture (for example, royalty-free content, your own meetings, or other permitted recordings). You are responsible for complying with local laws, copyright rules, and third-party Terms of Service. The authors are not responsible for misuse.

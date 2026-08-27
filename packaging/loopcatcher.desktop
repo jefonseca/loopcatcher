@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Loopcatcher
+Comment=Capture Linux loopback audio to AAC or OGG
+Exec=loopcatcher
+Terminal=true
+Type=Application
+Categories=AudioVideo;Audio;Recorder;
+Icon=loopcatcher
+Keywords=audio;loopback;record;pipewire;pulseaudio;

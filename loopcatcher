@@ -1,0 +1,1093 @@
+#!/bin/bash
+##############################################################################
+# Record system audio loopback to AAC or OGG
+##############################################################################
+
+set -u
+set -o pipefail
+
+SCRIPT_VERSION="0.1"
+
+if [[ $EUID -eq 0 ]]; then
+    echo "This script must not be run as root"
+    exit 1
+fi
+
+debug=false
+tui_last_message=""
+tui_state="starting"
+tui_track="-"
+tui_artist="-"
+tui_album="-"
+tui_output="-"
+tui_hint="Keys: c config menu | r reload config | Ctrl+C exit"
+
+source_sink_index=""
+created_null_sink=false
+nullsink_module_id=""
+should_exit=0
+recorder_pid=""
+dbus_monitor_pid=""
+record_error_log=""
+show_help=false
+show_version=false
+pending_track_change=true
+exit_on_any_key=false
+exit_reason=""
+no_intro=false
+
+sink_app_name="spotify"
+nulloutput_name="loopcatcher"
+aac_profile="29"
+bitrate="48"
+record_format="aac"
+filename_scheme="normal"
+output_directory=""
+
+session_name=""
+session_output_directory=""
+playbackstatus="Unknown"
+active_recording_signature=""
+
+trackid=""
+last_trackid=""
+title=""
+artist=""
+album=""
+albumartist=""
+tracknumber=""
+discnumber=""
+
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+config_dir="$XDG_CONFIG_HOME/loopcatcher"
+config_path="$config_dir/config"
+
+msg () {
+    if [[ "${2:-}" == "debug" ]]; then
+        if [[ "$debug" == "true" || "$debug" == "yes" ]]; then
+            printf '\033[0;31mDEBUG: %s\033[0m\n' "$1" 1>&2
+        fi
+        return
+    fi
+
+    tui_last_message="$1"
+    tui_render
+}
+
+wait_for_any_key_then_exit () {
+    exit_on_any_key=true
+    should_exit=0
+    tui_set "state" "session-ended"
+    tui_set "message" "$1"
+    tui_hint="Press any key to exit"
+}
+
+show_startup_info () {
+    printf '\033[H\033[2J'
+    printf 'loopcatcher v%s\n\n' "$SCRIPT_VERSION"
+    printf 'What this session will do:\n'
+    printf ' - Capture app/system audio through Linux loopback monitor sink\n'
+    printf ' - Save files under output_directory/session_name\n'
+    printf ' - Stop session automatically when playback is paused/stopped\n\n'
+    printf 'TUI shortcuts:\n'
+    printf ' - c : open config menu\n'
+    printf ' - r : reload config file\n'
+    printf ' - Ctrl+C : exit safely\n\n'
+    printf 'Press Enter to continue...'
+    read -r _ignore
+}
+
+tui_pad () {
+    local text="$1"
+    local width="$2"
+    printf "%-${width}s" "$text"
+}
+
+tui_render () {
+    local cols=90
+    local current_cols
+    local border
+
+    current_cols=$(tput cols 2>/dev/null || true)
+    if [[ -n "$current_cols" ]] && [[ "$current_cols" -ge 70 ]] 2>/dev/null; then
+        cols="$current_cols"
+    fi
+    border=$(printf '%*s' "$cols" '' | tr ' ' '=')
+
+    printf '\033[H\033[2J'
+    printf '\033[1;36m%s\033[0m\n' "$border"
+    printf '\033[1;36m%s\033[0m\n' "$(tui_pad " loopcatcher | state: $tui_state | playback: $playbackstatus " "$cols")"
+    printf '%s\n' "$border"
+    printf ' Track      : %s\n' "${tui_track:- -}"
+    printf ' Artist     : %s\n' "${tui_artist:- -}"
+    printf ' Album      : %s\n' "${tui_album:- -}"
+    printf ' Sink       : %s\n' "${source_sink_index:--}"
+    printf ' Session    : %s\n' "${session_name:--}"
+    printf ' Output dir : %s\n' "${session_output_directory:--}"
+    printf ' File       : %s\n' "$tui_output"
+    printf ' Config     : %s\n' "$config_path"
+    printf '%s\n' "$border"
+    printf ' %s\n' "$tui_last_message"
+    printf ' %s\n' "$tui_hint"
+}
+
+check_dependencies () {
+    local requirements='tr killall dbus-monitor pactl parec fdkaac oggenc tput'
+    local req
+    for req in $requirements; do
+        if ! command -v "$req" >/dev/null 2>&1; then
+            echo "FATAL: \"$req\" was not found"
+            exit 1
+        fi
+    done
+}
+
+ensure_config_dir () {
+    mkdir -p "$config_dir"
+    if [[ ! -f "$config_path" ]]; then
+        save_config
+    fi
+}
+
+load_config () {
+    if [[ -r "$config_path" ]]; then
+        # shellcheck disable=SC1090
+        source "$config_path"
+    fi
+
+    if [[ -n "${recordformat:-}" ]]; then
+        record_format="$recordformat"
+    fi
+    if [[ -n "${filenamescheme:-}" ]]; then
+        filename_scheme="$filenamescheme"
+    fi
+}
+
+save_config () {
+    cat > "$config_path" <<EOF
+# loopcatcher config
+debug="$debug"
+sink_app_name="$sink_app_name"
+nulloutput_name="$nulloutput_name"
+aac_profile="$aac_profile"
+bitrate="$bitrate"
+record_format="$record_format"
+filename_scheme="$filename_scheme"
+output_directory="$output_directory"
+EOF
+}
+
+reload_config () {
+    load_config
+    validate_settings
+    tui_set "message" "Configuration reloaded from $config_path"
+}
+
+validate_settings () {
+    case "$record_format" in
+        aac|ogg) ;;
+        *)
+            printf 'Invalid record format: %s (allowed: aac, ogg)\n' "$record_format"
+            exit 1
+            ;;
+    esac
+
+    case "$filename_scheme" in
+        normal|strict|strict-lc-nodir) ;;
+        *)
+            printf 'Invalid filename scheme: %s (allowed: normal, strict, strict-lc-nodir)\n' "$filename_scheme"
+            exit 1
+            ;;
+    esac
+
+    if [[ ! "$bitrate" =~ ^[0-9]+$ ]] || [[ "$bitrate" -le 0 ]]; then
+        printf 'Invalid bitrate: %s (must be a positive integer)\n' "$bitrate"
+        exit 1
+    fi
+
+    if [[ ! "$aac_profile" =~ ^[0-9]+$ ]] || [[ "$aac_profile" -le 0 ]]; then
+        printf 'Invalid aac_profile: %s (must be a positive integer)\n' "$aac_profile"
+        exit 1
+    fi
+
+    case "$debug" in
+        true|false|yes|no) ;;
+        *)
+            printf 'Invalid debug value: %s (allowed: true, false, yes, no)\n' "$debug"
+            exit 1
+            ;;
+    esac
+}
+
+tui_set () {
+    local key="$1"
+    local value="$2"
+    case "$key" in
+        state) tui_state="$value" ;;
+        track) tui_track="$value" ;;
+        artist) tui_artist="$value" ;;
+        album) tui_album="$value" ;;
+        output) tui_output="$value" ;;
+        message) tui_last_message="$value" ;;
+    esac
+    tui_render
+}
+
+browse_directory () {
+    local current="$1"
+    local options=()
+    local idx=1
+    local choice=""
+    local selected
+
+    if [[ ! -d "$current" ]]; then
+        current="$HOME"
+    fi
+
+    while true; do
+        printf '\033[H\033[2J'
+        printf 'Directory browser\n'
+        printf 'Current: %s\n\n' "$current"
+
+        options=()
+        shopt -s nullglob dotglob
+        for selected in "$current"/*/; do
+            options+=("${selected%/}")
+        done
+        shopt -u nullglob dotglob
+
+        if [[ ${#options[@]} -eq 0 ]]; then
+            printf 'No subdirectories found here.\n'
+        else
+            idx=1
+            for selected in "${options[@]}"; do
+                printf '%s) %s\n' "$idx" "$(basename "$selected")"
+                idx=$((idx + 1))
+            done
+        fi
+
+        printf '\nCommands: number=open, u=up, s=select, q=cancel\n'
+        printf 'Choose: '
+        read -r choice
+
+        case "$choice" in
+            u|U) current="$(dirname "$current")" ;;
+            s|S) echo "$current" ; return 0 ;;
+            q|Q) return 1 ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#options[@]} ]]; then
+                    current="${options[$((choice - 1))]}"
+                fi
+                ;;
+        esac
+    done
+}
+
+default_music_dir () {
+    local music_dir=""
+    if command -v xdg-user-dir >/dev/null 2>&1; then
+        music_dir="$(xdg-user-dir MUSIC 2>/dev/null || true)"
+        if [[ -n "$music_dir" ]]; then
+            echo "$music_dir"
+            return
+        fi
+    fi
+
+    if [[ -f "$HOME/.config/user-dirs.dirs" ]]; then
+        music_dir=$(grep '^XDG_MUSIC_DIR=' "$HOME/.config/user-dirs.dirs" | cut -d'=' -f2 | tr -d '"')
+        music_dir="${music_dir//\$HOME/$HOME}"
+        if [[ -n "$music_dir" ]]; then
+            echo "$music_dir"
+            return
+        fi
+    fi
+
+    echo "$HOME/Music"
+}
+
+initialize_output_directory () {
+    local selected
+    if [[ -n "$output_directory" ]]; then
+        mkdir -p "$output_directory"
+        return
+    fi
+
+    output_directory="$(default_music_dir)"
+    if [[ -n "$output_directory" ]]; then
+        mkdir -p "$output_directory"
+        save_config
+        msg "Output directory initialized to $output_directory"
+        return
+    fi
+
+    if selected="$(browse_directory "$HOME")"; then
+        output_directory="$selected"
+        mkdir -p "$output_directory"
+        save_config
+        msg "Output directory set to $output_directory"
+    else
+        msg "No output directory selected. Exiting..."
+        exit 1
+    fi
+}
+
+choose_output_directory () {
+    local choice=""
+    local selected=""
+    printf '\nOutput directory setup\n'
+    printf '1) Type path manually\n'
+    printf '2) Browse directories\n'
+    printf 'Choose: '
+    read -r choice
+
+    case "$choice" in
+        1)
+            printf 'Path: '
+            read -r selected
+            if [[ -n "$selected" ]]; then
+                output_directory="$selected"
+            fi
+            ;;
+        2)
+            if selected="$(browse_directory "$output_directory")"; then
+                output_directory="$selected"
+            fi
+            ;;
+    esac
+
+    if [[ -n "$output_directory" ]]; then
+        mkdir -p "$output_directory"
+        save_config
+        msg "Output directory updated: $output_directory"
+    fi
+}
+
+prompt_session_name () {
+    local value="${session_name:-}"
+    local candidate=""
+    local validation_error=""
+
+    if [[ -n "$value" ]]; then
+        if [[ "$value" == *"/"* ]]; then
+            msg "Invalid session name from CLI: cannot include '/'"
+            exit 1
+        fi
+        candidate="$output_directory/$value"
+        if [[ -d "$candidate" ]] && [[ -n "$(ls -A "$candidate" 2>/dev/null)" ]]; then
+            msg "Session folder from CLI exists and is not empty: $candidate"
+            exit 1
+        fi
+        session_name="$value"
+        session_output_directory="$candidate"
+        mkdir -p "$session_output_directory"
+        tui_set "message" "Session selected from CLI: $session_name"
+        return
+    fi
+
+    while true; do
+        printf '\033[H\033[2J'
+        printf '============================================================\n'
+        printf ' loopcatcher session setup\n'
+        printf '============================================================\n\n'
+        printf ' Base output folder:\n'
+        printf '   %s\n\n' "$output_directory"
+        printf ' Session name info:\n'
+        printf '   - Identifies this run as one unique capture session\n'
+        printf '   - Files are saved under: output_directory/session_name\n'
+        printf '   - Tip: use date-purpose, e.g. 2026-08-27-album\n\n'
+        printf ' Reminder:\n'
+        printf '   Disable Autoplay in your player software so session ends when\n'
+        printf '   playlist/album playback finishes.\n\n'
+        printf '============================================================\n'
+        if [[ -n "$validation_error" ]]; then
+            printf ' Warning: %s\n' "$validation_error"
+            printf -- '------------------------------------------------------------\n'
+        fi
+        printf 'Enter session name (required): '
+        read -r value
+
+        if [[ -z "$value" ]]; then
+            validation_error="Session name cannot be empty"
+            continue
+        fi
+        if [[ "$value" == *"/"* ]]; then
+            validation_error="Session name cannot include '/'"
+            continue
+        fi
+
+        candidate="$output_directory/$value"
+        if [[ -d "$candidate" ]] && [[ -n "$(ls -A "$candidate" 2>/dev/null)" ]]; then
+            validation_error="Session folder exists and is not empty: $candidate"
+            continue
+        fi
+
+        validation_error=""
+        session_name="$value"
+        session_output_directory="$candidate"
+        mkdir -p "$session_output_directory"
+        tui_set "message" "Session selected: $session_name"
+        return
+    done
+}
+
+config_prompt_value () {
+    local var_name="$1"
+    local label="$2"
+    local current_value
+    local new_value=""
+    current_value="${!var_name}"
+    printf '%s [%s]: ' "$label" "$current_value"
+    read -r new_value
+    if [[ -n "$new_value" ]]; then
+        printf -v "$var_name" '%s' "$new_value"
+    fi
+}
+
+open_config_menu () {
+    local opt=""
+    while true; do
+        printf '\033[H\033[2J'
+        printf 'loopcatcher config menu\n'
+        printf 'Config file: %s\n\n' "$config_path"
+        printf '1) record_format      : %s\n' "$record_format"
+        printf '   Output codec. aac gives .m4a, ogg gives .oga\n'
+        printf '2) bitrate            : %s\n' "$bitrate"
+        printf '   Encoding bitrate. Example: 48 (AAC HE v2), 128 (OGG)\n'
+        printf '3) aac_profile        : %s\n' "$aac_profile"
+        printf '   fdkaac profile (used only when record_format=aac)\n'
+        printf '4) filename_scheme    : %s\n' "$filename_scheme"
+        printf '   normal/strict/strict-lc-nodir naming rules\n'
+        printf '5) output_directory   : %s\n' "$output_directory"
+        printf '   Base folder where each session folder is created\n'
+        printf '6) sink_app_name      : %s\n' "$sink_app_name"
+        printf '   Target app name in audio sink (ex: spotify, com.spotify.Client)\n'
+        printf '7) nulloutput_name    : %s\n' "$nulloutput_name"
+        printf '   Virtual sink name used for monitor recording\n'
+        printf '8) debug              : %s\n' "$debug"
+        printf '   true/false to show internal debug logs\n\n'
+        printf 's) save\n'
+        printf 'x) exit menu\n\n'
+        printf 'Choose: '
+        read -r opt
+
+        case "$opt" in
+            1) config_prompt_value "record_format" "record_format (aac|ogg)" ;;
+            2) config_prompt_value "bitrate" "bitrate" ;;
+            3) config_prompt_value "aac_profile" "aac_profile" ;;
+            4) config_prompt_value "filename_scheme" "filename_scheme (normal|strict|strict-lc-nodir)" ;;
+            5) choose_output_directory ;;
+            6) config_prompt_value "sink_app_name" "sink_app_name" ;;
+            7) config_prompt_value "nulloutput_name" "nulloutput_name" ;;
+            8) config_prompt_value "debug" "debug (true|false)" ;;
+            s)
+                save_config
+                msg "Config saved"
+                ;;
+            x)
+                save_config
+                break
+                ;;
+        esac
+    done
+    tui_set "message" "Exited configuration menu"
+}
+
+check_audio_server () {
+    if ! pactl info >/dev/null 2>&1; then
+        msg "FATAL: Cannot connect to PulseAudio/PipeWire session daemon"
+        msg "On KDE, ensure pipewire-pulse is running in your user session"
+        msg "Try: systemctl --user status pipewire pipewire-pulse wireplumber"
+        exit 1
+    fi
+}
+
+is_target_sink_app () {
+    local configured_name="$1"
+    local app_name="$2"
+    if [[ -n "$configured_name" ]] && [[ "$app_name" == "$configured_name" ]]; then
+        return 0
+    fi
+    case "${app_name,,}" in
+        spotify|spotify*) return 0 ;;
+        com.spotify.client|com.spotify.client*) return 0 ;;
+    esac
+    return 1
+}
+
+get_target_sink_index () {
+    local sink_list
+    local sink_index=""
+    local sink_app=""
+    local line
+
+    sink_list="$(pactl list sink-inputs 2>/dev/null)"
+    if [[ -z "$sink_list" ]]; then
+        msg "No sink-inputs found. Start playback in your target app first."
+        return 1
+    fi
+
+    while IFS= read -r line; do
+        if [[ $line == "Sink Input #"* ]]; then
+            sink_index="${line#Sink Input #}"
+        elif [[ $line == *"application.name = "* ]]; then
+            sink_app="$(cut -d '"' -f2 <<< "$line")"
+            if is_target_sink_app "$sink_app_name" "$sink_app"; then
+                source_sink_index="$sink_index"
+                msg "Matched target sink: $sink_app" "debug"
+                return 0
+            fi
+        fi
+    done <<< "$sink_list"
+
+    msg "Target sink not found. Use 'c' to adjust sink_app_name if needed."
+    return 1
+}
+
+ensure_target_routed () {
+    if ! get_target_sink_index; then
+        return 1
+    fi
+
+    move_target_output
+    return 0
+}
+
+create_null_audio_output () {
+    nullsink_module_id="$(pactl list short modules | grep "module-null-sink" | grep "sink_name=$nulloutput_name" | cut -f1 | head -n 1)"
+    if [[ -z "$nullsink_module_id" ]]; then
+        nullsink_module_id="$(pactl load-module module-null-sink sink_name="$nulloutput_name")"
+        if [[ $? -ne 0 ]]; then
+            msg "FATAL: Cannot create null sink '$nulloutput_name'"
+            exit 1
+        fi
+        created_null_sink=true
+    fi
+}
+
+move_target_output () {
+    pactl move-sink-input "$source_sink_index" "$nulloutput_name"
+    if [[ $? -ne 0 ]]; then
+        msg "FATAL: Cannot move target sink to '$nulloutput_name'"
+        exit 1
+    fi
+}
+
+sanitize_str () {
+    if [[ "$1" == "strict" ]]; then
+        tr -dc '[:alnum:]\n\r' <<< "$2"
+    elif [[ "$1" == "strict-lc" ]]; then
+        tr -dc '[:alnum:]\n\r' <<< "$2" | tr '[:upper:]' '[:lower:]'
+    fi
+}
+
+unique_output_path () {
+    local base="$1"
+    if [[ ! -e "$base" ]]; then
+        echo "$base"
+        return
+    fi
+
+    local dir
+    local file
+    local ext
+    local stem
+    local n=2
+
+    dir="$(dirname "$base")"
+    file="$(basename "$base")"
+    ext="${file##*.}"
+    stem="${file%.*}"
+
+    while [[ -e "$dir/${stem}_$n.$ext" ]]; do
+        n=$((n + 1))
+    done
+    echo "$dir/${stem}_$n.$ext"
+}
+
+file_path_structure () {
+    local i_artist="$1"
+    local i_album="$2"
+    local i_title="$3"
+    local extension="$4"
+    local outdir
+    local outfile
+    local base
+
+    case "$filename_scheme" in
+        normal)
+            outdir="$session_output_directory/${i_artist//[^ A-Za-z0-9._-]/}/${i_album//[^ A-Za-z0-9._-]/}"
+            outfile="${i_title//[^ A-Za-z0-9._-]/}.$extension"
+            ;;
+        strict)
+            outdir="$session_output_directory/$(sanitize_str "strict" "$i_artist")/$(sanitize_str "strict" "$i_album")"
+            outfile="$(sanitize_str "strict" "$i_title").$extension"
+            ;;
+        strict-lc-nodir)
+            outdir="$session_output_directory"
+            outfile="$(sanitize_str "strict-lc" "$i_artist")_$(sanitize_str "strict-lc" "$i_album")_$(sanitize_str "strict-lc" "$i_title").$extension"
+            ;;
+        *)
+            msg "FATAL: invalid filename_scheme '$filename_scheme'"
+            exit 1
+            ;;
+    esac
+
+    mkdir -p "$outdir"
+    base="$outdir/$outfile"
+    unique_output_path "$base"
+}
+
+get_dbusmessages () {
+    local expect_key=""
+    local expect_type=""
+    local line
+
+    while IFS= read -r line; do
+        case "$line" in
+            *'string "PlaybackStatus"'*)
+                expect_key="playbackstatus"
+                expect_type="string"
+                continue
+                ;;
+            *'string "mpris:trackid"'*)
+                expect_key="trackid"
+                expect_type="string"
+                continue
+                ;;
+            *'string "xesam:album"'*)
+                expect_key="album"
+                expect_type="string"
+                continue
+                ;;
+            *'string "xesam:albumArtist"'*)
+                expect_key="albumartist"
+                expect_type="string"
+                continue
+                ;;
+            *'string "xesam:artist"'*)
+                expect_key="artist"
+                expect_type="string"
+                continue
+                ;;
+            *'string "xesam:discNumber"'*)
+                expect_key="discnumber"
+                expect_type="int32"
+                continue
+                ;;
+            *'string "xesam:title"'*)
+                expect_key="title"
+                expect_type="string"
+                continue
+                ;;
+            *'string "xesam:trackNumber"'*)
+                expect_key="tracknumber"
+                expect_type="int32"
+                continue
+                ;;
+        esac
+
+        if [[ -z "$expect_key" ]]; then
+            continue
+        fi
+
+        if [[ "$expect_type" == "string" ]] && [[ $line == *'string "'* ]]; then
+            echo "$expect_key -> $(cut -d '"' -f2 <<< "$line")"
+            expect_key=""
+            expect_type=""
+            continue
+        fi
+
+        if [[ "$expect_type" == "int32" ]] && [[ $line == *'int32 '* ]]; then
+            echo "$expect_key -> $(awk '{print substr($2,1)}' <<< "$line")"
+            expect_key=""
+            expect_type=""
+            continue
+        fi
+    done < <(dbus-monitor "$1")
+}
+
+stop_current_recording () {
+    if [[ -n "$recorder_pid" ]] && kill -0 "$recorder_pid" 2>/dev/null; then
+        kill "$recorder_pid" 2>/dev/null || true
+    fi
+    killall fdkaac 2>/dev/null || true
+    killall oggenc 2>/dev/null || true
+    killall parec 2>/dev/null || true
+    recorder_pid=""
+
+    if [[ -n "$record_error_log" ]] && [[ -f "$record_error_log" ]]; then
+        rm -f "$record_error_log"
+    fi
+    record_error_log=""
+}
+
+start_recording () {
+    local i_artist="$1"
+    local i_album="$2"
+    local i_title="$3"
+    local i_albumartist="$4"
+    local i_tracknumber="$5"
+    local i_discnumber="$6"
+    local outputfile=""
+
+    if [[ -z "$i_title" || -z "$i_artist" ]]; then
+        return 1
+    fi
+
+    outputfile="$(file_path_structure "$i_artist" "$i_album" "$i_title" "$([[ "$record_format" == "ogg" ]] && echo "oga" || echo "m4a")")"
+    stop_current_recording
+
+    if ! ensure_target_routed; then
+        msg "Could not route target sink to monitor output"
+        return 1
+    fi
+
+    record_error_log="$(mktemp)"
+
+    case "$record_format" in
+        aac)
+            parec -d "$nulloutput_name.monitor" | fdkaac -R -S -p "$aac_profile" --bitrate "${bitrate}k" --moov-before-mdat --afterburner 1 \
+            --title "$i_title" --artist "$i_artist" --album "$i_album" --album-artist "$i_albumartist" --track "$i_tracknumber" --disk "$i_discnumber" \
+            - -o "$outputfile" 2>"$record_error_log" &
+            recorder_pid=$!
+            ;;
+        ogg)
+            parec -d "$nulloutput_name.monitor" | oggenc -b "$bitrate" --raw \
+            --title "$i_title" --artist "$i_artist" --album "$i_album" --tracknum "$i_tracknumber" \
+            - -o "$outputfile" 2>"$record_error_log" &
+            recorder_pid=$!
+            ;;
+        *)
+            msg "Invalid record_format '$record_format'"
+            return 1
+            ;;
+    esac
+
+    sleep 0.2
+    if ! kill -0 "$recorder_pid" 2>/dev/null; then
+        local err=""
+        if [[ -s "$record_error_log" ]]; then
+            err="$(tr '\n' ' ' < "$record_error_log")"
+        fi
+        if [[ -n "$err" ]]; then
+            msg "Recorder failed to start: $err"
+        else
+            msg "Recorder failed to start. Check codec dependencies and format settings."
+        fi
+        return 1
+    fi
+
+    tui_set "state" "recording"
+    tui_set "output" "$outputfile"
+    tui_set "message" "Recording '$i_title' by '$i_artist'"
+    return 0
+}
+
+maybe_start_recording () {
+    local signature
+
+    if [[ "$playbackstatus" != "Playing" ]]; then
+        return
+    fi
+    if [[ -z "$title" || -z "$artist" ]]; then
+        return
+    fi
+
+    signature="${trackid:-$artist|$album|$title}"
+
+    if [[ "$signature" == "$active_recording_signature" ]]; then
+        return
+    fi
+
+    if start_recording "$artist" "$album" "$title" "$albumartist" "$tracknumber" "$discnumber"; then
+        active_recording_signature="$signature"
+        pending_track_change=false
+    fi
+}
+
+process_dbus_line () {
+    local dbus_read="$1"
+
+    case "$dbus_read" in
+        'playbackstatus -> '*)
+            playbackstatus="${dbus_read#playbackstatus -> }"
+            if [[ "$playbackstatus" != "Playing" ]]; then
+                stop_current_recording
+                active_recording_signature=""
+                wait_for_any_key_then_exit "Playback is '$playbackstatus'. Session finished."
+            else
+                maybe_start_recording
+            fi
+            ;;
+        'trackid -> '*)
+            trackid="${dbus_read#trackid -> }"
+            if [[ "$trackid" != "$last_trackid" ]]; then
+                last_trackid="$trackid"
+                pending_track_change=true
+                active_recording_signature=""
+                title=""
+                artist=""
+                album=""
+                albumartist=""
+                tracknumber=""
+                discnumber=""
+                stop_current_recording
+                tui_set "state" "monitoring"
+                tui_set "message" "Detected track change. Waiting for metadata..."
+            fi
+            maybe_start_recording
+            ;;
+        'title -> '*)
+            title="${dbus_read#title -> }"
+            tui_set "track" "$title"
+            maybe_start_recording
+            ;;
+        'artist -> '*)
+            artist="${dbus_read#artist -> }"
+            tui_set "artist" "$artist"
+            maybe_start_recording
+            ;;
+        'album -> '*)
+            album="${dbus_read#album -> }"
+            tui_set "album" "$album"
+            maybe_start_recording
+            ;;
+        'albumartist -> '*)
+            albumartist="${dbus_read#albumartist -> }"
+            ;;
+        'tracknumber -> '*)
+            tracknumber="${dbus_read#tracknumber -> }"
+            ;;
+        'discnumber -> '*)
+            discnumber="${dbus_read#discnumber -> }"
+            ;;
+    esac
+}
+
+handle_keypress () {
+    local key="$1"
+
+    if [[ "$exit_on_any_key" == "true" ]]; then
+        should_exit=1
+        return
+    fi
+
+    case "$key" in
+        c|C)
+            open_config_menu
+            ;;
+        r|R)
+            reload_config
+            ;;
+    esac
+}
+
+cleanup () {
+    stop_current_recording
+    if [[ -n "$dbus_monitor_pid" ]] && kill -0 "$dbus_monitor_pid" 2>/dev/null; then
+        kill "$dbus_monitor_pid" 2>/dev/null || true
+    fi
+    if [[ "$created_null_sink" == "true" ]] && [[ -n "$nullsink_module_id" ]]; then
+        pactl unload-module "$nullsink_module_id" 2>/dev/null || true
+    fi
+    printf '\033[0m\n'
+}
+
+get_options () {
+    local usage="loopcatcher v${SCRIPT_VERSION}
+
+Usage: ${0##*/} [options]
+
+Behavior:
+  - If output-directory is omitted, first run uses XDG Music folder and saves it to config.
+  - Session name is required every run (interactive prompt if not provided with --session).
+  - Output goes to: output-directory/session-name
+  - Session auto-finishes when playback becomes pause/stop.
+
+Options:
+  --debug                   Enable debug
+  --output <dir>            Output directory
+      --session <name>      Session name override
+  --format <format>         Record format: aac or ogg
+  --aac-profile <id>        AAC profile (aac only)
+  --bitrate <kbps>          Bitrate target
+  --scheme <scheme>         Filename scheme: normal, strict, strict-lc-nodir
+  --config <path>           Override config file path
+  --no-intro                Skip startup intro screen
+  --help                    Show help
+  --version                 Show version
+"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --debug)
+                debug=true
+                shift
+                ;;
+            --help)
+                show_help=true
+                shift
+                ;;
+            --version)
+                show_version=true
+                shift
+                ;;
+            --output)
+                [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }
+                output_directory="$2"
+                shift 2
+                ;;
+            --output=*)
+                output_directory="${1#*=}"
+                shift
+                ;;
+            --no-intro)
+                no_intro=true
+                shift
+                ;;
+            --session)
+                [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }
+                session_name="$2"
+                shift 2
+                ;;
+            --session=*)
+                session_name="${1#*=}"
+                shift
+                ;;
+            --format)
+                [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }
+                record_format="$2"
+                case "$record_format" in
+                    aac|ogg) ;;
+                    *) printf 'Invalid --format value: %s\n' "$record_format"; exit 1 ;;
+                esac
+                shift 2
+                ;;
+            --format=*)
+                record_format="${1#*=}"
+                case "$record_format" in
+                    aac|ogg) ;;
+                    *) printf 'Invalid --format value: %s\n' "$record_format"; exit 1 ;;
+                esac
+                shift
+                ;;
+            --aac-profile)
+                [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }
+                aac_profile="$2"
+                shift 2
+                ;;
+            --aac-profile=*)
+                aac_profile="${1#*=}"
+                shift
+                ;;
+            --bitrate)
+                [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }
+                bitrate="$2"
+                shift 2
+                ;;
+            --bitrate=*)
+                bitrate="${1#*=}"
+                shift
+                ;;
+            --scheme)
+                [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }
+                filename_scheme="$2"
+                case "$filename_scheme" in
+                    normal|strict|strict-lc-nodir) ;;
+                    *) printf 'Invalid --scheme value: %s\n' "$filename_scheme"; exit 1 ;;
+                esac
+                shift 2
+                ;;
+            --scheme=*)
+                filename_scheme="${1#*=}"
+                case "$filename_scheme" in
+                    normal|strict|strict-lc-nodir) ;;
+                    *) printf 'Invalid --scheme value: %s\n' "$filename_scheme"; exit 1 ;;
+                esac
+                shift
+                ;;
+            --config)
+                [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }
+                config_path="$2"
+                config_dir="$(dirname "$config_path")"
+                shift 2
+                ;;
+            --config=*)
+                config_path="${1#*=}"
+                config_dir="$(dirname "$config_path")"
+                shift
+                ;;
+            --)
+                shift
+                ;;
+            -*)
+                printf '%s\n' "$usage"
+                exit 1
+                ;;
+            *)
+                printf 'Unknown argument: %s\n\n' "$1"
+                printf '%s\n' "$usage"
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ "$show_help" == "true" ]]; then
+        printf '%s\n' "$usage"
+        exit 0
+    fi
+    if [[ "$show_version" == "true" ]]; then
+        printf 'loopcatcher version %s\n' "$SCRIPT_VERSION"
+        exit 0
+    fi
+}
+
+main () {
+    get_options "$@"
+    check_dependencies
+    ensure_config_dir
+    load_config
+    get_options "$@"
+    validate_settings
+    if [[ "$no_intro" != "true" ]]; then
+        show_startup_info
+    fi
+    tui_render
+
+    initialize_output_directory
+    prompt_session_name
+    check_audio_server
+
+    if ! get_target_sink_index; then
+        exit 1
+    fi
+
+    create_null_audio_output
+    move_target_output
+    tui_set "state" "monitoring"
+    tui_set "message" "Monitoring app/player MPRIS events..."
+
+    trap cleanup EXIT INT TERM
+
+    coproc DBUS_MONITOR { get_dbusmessages "path=/org/mpris/MediaPlayer2,member=PropertiesChanged"; }
+    dbus_monitor_pid=$!
+
+    while [[ $should_exit -eq 0 ]]; do
+        if [[ "$exit_on_any_key" != "true" ]]; then
+            if IFS= read -r -t 0.20 -u "${DBUS_MONITOR[0]}" dbus_read; then
+                process_dbus_line "$dbus_read"
+            fi
+        fi
+
+        if IFS= read -rsn1 -t 0.05 key; then
+            handle_keypress "$key"
+        fi
+
+        if [[ "$exit_on_any_key" != "true" ]] && ! kill -0 "$dbus_monitor_pid" 2>/dev/null; then
+            msg "dbus-monitor ended. Exiting..."
+            break
+        fi
+    done
+}
+
+main "$@"

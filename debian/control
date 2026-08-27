@@ -1,0 +1,22 @@
+Source: loopcatcher
+Section: sound
+Priority: optional
+Maintainer: loopcatcher maintainers <maintainers@example.com>
+Build-Depends: debhelper (>= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/jefonseca/loopcatcher
+
+Package: loopcatcher
+Architecture: all
+Depends:
+ bash,
+ dbus,
+ pulseaudio-utils,
+ vorbis-tools,
+ fdkaac
+Description: Record Linux app/system loopback audio to AAC or OGG files
+ loopcatcher routes an application sink input into a monitor sink and encodes
+ loopback audio into AAC or OGG while preserving metadata when available.
+ It supports interactive TUI controls and stores runtime configuration under
+ ~/.config/loopcatcher.

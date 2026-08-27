@@ -1,0 +1,7 @@
+loopcatcher usr/bin/
+packaging/loopcatcher.desktop usr/share/applications/
+icons/32x32/loopcatcher.png usr/share/icons/hicolor/32x32/apps/
+icons/64x64/loopcatcher.png usr/share/icons/hicolor/64x64/apps/
+icons/96x96/loopcatcher.png usr/share/icons/hicolor/96x96/apps/
+icons/128x128/loopcatcher.png usr/share/icons/hicolor/128x128/apps/
+icons/scalable/loopcatcher.svg usr/share/icons/hicolor/scalable/apps/
