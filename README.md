@@ -53,9 +53,13 @@ Recommended playback flow:
 ## TUI controls
 - `c` open config menu
 - `r` reload config from disk
-- `Ctrl+C` exit safely
+- `q` quit safely (removes the loopback sink before exiting)
 
 When playback switches to pause/stop, the session ends and the TUI waits with `Press any key to exit`.
+Before stopping, capture is kept alive for ~1s so the buffered audio tail is written to the file
+instead of being truncated (this can leave up to ~1s of trailing silence at the end of the last track).
+
+On exit the virtual `nulloutput_name` sink is unloaded, so it never stays active in your audio devices list.
 
 ## Configuration
 - Config path: `~/.config/loopcatcher/config`

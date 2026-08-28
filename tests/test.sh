@@ -116,6 +116,44 @@ test_track_change_resets_metadata () {
     [[ "$out" == "|||" ]]
 }
 
+test_stop_recording_cleans_up () {
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        # shellcheck disable=SC2317
+        tui_render () { :; }
+        record_fifo_dir="$(mktemp -d)"
+        record_error_log="$(mktemp)"
+        fifo_dir_before="$record_fifo_dir"
+        log_before="$record_error_log"
+        parec_pid=""
+        encoder_pid=""
+        stop_current_recording
+        [[ -e "$fifo_dir_before" ]] && printf 'FIFO_LEFT '
+        [[ -e "$log_before" ]] && printf 'LOG_LEFT '
+        printf '%s|%s|%s' "$record_fifo_dir" "$record_error_log" "$stopping_recording"
+    })"
+
+    [[ "$out" == "||false" ]]
+}
+
+test_q_key_requests_exit () {
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        # shellcheck disable=SC2317
+        tui_render () { :; }
+        should_exit=0
+        exit_on_any_key=false
+        handle_keypress "q"
+        printf '%s' "$should_exit"
+    })"
+
+    [[ "$out" == "1" ]]
+}
+
 run_test () {
     local name="$1"
     if "$name"; then
@@ -134,6 +172,8 @@ main () {
     run_test test_file_path_structure_and_uniqueness
     run_test test_pause_stops_session
     run_test test_track_change_resets_metadata
+    run_test test_stop_recording_cleans_up
+    run_test test_q_key_requests_exit
 
     printf '\nTests: %s passed, %s failed\n' "$pass_count" "$fail_count"
 

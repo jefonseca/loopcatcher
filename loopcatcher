@@ -18,13 +18,19 @@ tui_track="-"
 tui_artist="-"
 tui_album="-"
 tui_output="-"
-tui_hint="Keys: c config menu | r reload config | Ctrl+C exit"
+tui_hint="Keys: c config menu | r reload config | q quit"
 
 source_sink_index=""
 created_null_sink=false
 nullsink_module_id=""
 should_exit=0
-recorder_pid=""
+parec_pid=""
+encoder_pid=""
+record_fifo_dir=""
+stopping_recording=false
+# Extra capture time (seconds) after the player stops, so the audio tail
+# still buffered in the pipeline gets written instead of being truncated.
+tail_drain_seconds=1
 dbus_monitor_pid=""
 record_error_log=""
 show_help=false
@@ -120,7 +126,7 @@ show_startup_info () {
     printf 'TUI shortcuts:\n'
     printf ' - c : open config menu\n'
     printf ' - r : reload config file\n'
-    printf ' - Ctrl+C : exit safely\n\n'
+    printf ' - q : quit safely\n\n'
     printf 'Press Enter to continue...'
     read -r _ignore
 }
@@ -161,7 +167,7 @@ tui_render () {
 }
 
 check_dependencies () {
-    local requirements='tr killall dbus-monitor pactl parec fdkaac oggenc tput'
+    local requirements='tr dbus-monitor pactl parec tput mktemp mkfifo awk'
     local req
     for req in $requirements; do
         if ! command -v "$req" >/dev/null 2>&1; then
@@ -169,6 +175,19 @@ check_dependencies () {
             exit 1
         fi
     done
+}
+
+check_encoder_dependency () {
+    local tool
+    case "$record_format" in
+        aac) tool="fdkaac" ;;
+        ogg) tool="oggenc" ;;
+        *) return ;;
+    esac
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf 'FATAL: "%s" is required for record_format=%s but was not found\n' "$tool" "$record_format"
+        exit 1
+    fi
 }
 
 ensure_config_dir () {
@@ -579,7 +598,12 @@ ensure_target_routed () {
         return 1
     fi
 
-    move_target_output
+    # Non-fatal here: a transient move failure mid-session should not kill
+    # the whole run (the initial routing in main() still uses move_target_output).
+    if ! pactl move-sink-input "$source_sink_index" "$nulloutput_name" 2>/dev/null; then
+        msg "Could not move sink-input $source_sink_index to '$nulloutput_name'"
+        return 1
+    fi
     return 0
 }
 
@@ -727,7 +751,7 @@ get_dbusmessages () {
         fi
 
         if [[ "$expect_type" == "int32" ]] && [[ $line == *'int32 '* ]]; then
-            echo "$expect_key -> $(awk '{print substr($2,1)}' <<< "$line")"
+            echo "$expect_key -> $(awk '{print $2}' <<< "$line")"
             expect_key=""
             expect_type=""
             continue
@@ -736,18 +760,60 @@ get_dbusmessages () {
 }
 
 stop_current_recording () {
-    if [[ -n "$recorder_pid" ]] && kill -0 "$recorder_pid" 2>/dev/null; then
-        kill "$recorder_pid" 2>/dev/null || true
+    local mode="${1:-quick}"
+    local fifo_dir="$record_fifo_dir"
+    local waited=0
+    local pid
+
+    if [[ "$stopping_recording" == "true" ]]; then
+        return
     fi
-    killall fdkaac 2>/dev/null || true
-    killall oggenc 2>/dev/null || true
-    killall parec 2>/dev/null || true
-    recorder_pid=""
+    stopping_recording=true
+
+    if [[ -n "$parec_pid" ]] || [[ -n "$encoder_pid" ]]; then
+        # Session end: keep capturing a moment longer so the audio tail that
+        # is still travelling through the sink -> parec -> pipe -> encoder
+        # chain when the player's stop event arrives is written to disk
+        # instead of truncated.
+        if [[ "$mode" == "drain" ]] && [[ -n "$parec_pid" ]] && kill -0 "$parec_pid" 2>/dev/null; then
+            sleep "$tail_drain_seconds"
+        fi
+
+        # Stop capture first so the encoder receives EOF and can flush its
+        # remaining frames and write a clean container trailer, rather than
+        # being killed mid-buffer.
+        if [[ -n "$parec_pid" ]] && kill -0 "$parec_pid" 2>/dev/null; then
+            kill "$parec_pid" 2>/dev/null || true
+        fi
+
+        # Give the encoder time to drain the pipe and finalize the file.
+        if [[ -n "$encoder_pid" ]]; then
+            while kill -0 "$encoder_pid" 2>/dev/null && [[ $waited -lt 40 ]]; do
+                sleep 0.05
+                waited=$((waited + 1))
+            done
+        fi
+    fi
+
+    for pid in "$parec_pid" "$encoder_pid"; do
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+    parec_pid=""
+    encoder_pid=""
+
+    if [[ -n "$fifo_dir" ]] && [[ -d "$fifo_dir" ]]; then
+        rm -rf "$fifo_dir"
+    fi
+    record_fifo_dir=""
 
     if [[ -n "$record_error_log" ]] && [[ -f "$record_error_log" ]]; then
         rm -f "$record_error_log"
     fi
     record_error_log=""
+
+    stopping_recording=false
 }
 
 start_recording () {
@@ -758,6 +824,7 @@ start_recording () {
     local i_tracknumber="$5"
     local i_discnumber="$6"
     local outputfile=""
+    local record_fifo=""
 
     if [[ -z "$i_title" || -z "$i_artist" ]]; then
         return 1
@@ -772,32 +839,49 @@ start_recording () {
     fi
 
     record_error_log="$(mktemp)"
+    record_fifo_dir="$(mktemp -d)"
+    record_fifo="$record_fifo_dir/pcm"
+    if ! mkfifo "$record_fifo" 2>/dev/null; then
+        msg "Could not create capture pipe under $record_fifo_dir"
+        stop_current_recording
+        return 1
+    fi
 
+    # Start the encoder first (it blocks on the pipe until parec writes),
+    # then start capture. Keeping parec and the encoder as separately tracked
+    # processes lets us stop capture first on shutdown so the encoder can
+    # flush and finalize instead of being killed mid-stream.
     case "$record_format" in
         aac)
-            parec -d "$nulloutput_name.monitor" | fdkaac -R -S -p "$aac_profile" --bitrate "${bitrate}k" --moov-before-mdat --afterburner 1 \
-            --title "$i_title" --artist "$i_artist" --album "$i_album" --album-artist "$i_albumartist" --track "$i_tracknumber" --disk "$i_discnumber" \
-            - -o "$outputfile" 2>"$record_error_log" &
-            recorder_pid=$!
+            fdkaac -R -S -p "$aac_profile" --bitrate "${bitrate}k" --moov-before-mdat --afterburner 1 \
+                --title "$i_title" --artist "$i_artist" --album "$i_album" --album-artist "$i_albumartist" \
+                --track "$i_tracknumber" --disk "$i_discnumber" \
+                - -o "$outputfile" < "$record_fifo" 2>"$record_error_log" &
+            encoder_pid=$!
             ;;
         ogg)
-            parec -d "$nulloutput_name.monitor" | oggenc -b "$bitrate" --raw \
-            --title "$i_title" --artist "$i_artist" --album "$i_album" --tracknum "$i_tracknumber" \
-            - -o "$outputfile" 2>"$record_error_log" &
-            recorder_pid=$!
+            oggenc -b "$bitrate" --raw \
+                --title "$i_title" --artist "$i_artist" --album "$i_album" --tracknum "$i_tracknumber" \
+                - -o "$outputfile" < "$record_fifo" 2>"$record_error_log" &
+            encoder_pid=$!
             ;;
         *)
             msg "Invalid record_format '$record_format'"
+            stop_current_recording
             return 1
             ;;
     esac
 
+    parec -d "$nulloutput_name.monitor" --latency-msec=50 > "$record_fifo" 2>>"$record_error_log" &
+    parec_pid=$!
+
     sleep 0.2
-    if ! kill -0 "$recorder_pid" 2>/dev/null; then
+    if ! kill -0 "$parec_pid" 2>/dev/null || ! kill -0 "$encoder_pid" 2>/dev/null; then
         local err=""
         if [[ -s "$record_error_log" ]]; then
             err="$(tr '\n' ' ' < "$record_error_log")"
         fi
+        stop_current_recording
         if [[ -n "$err" ]]; then
             msg "Recorder failed to start: $err"
         else
@@ -840,7 +924,7 @@ process_dbus_line () {
         'playbackstatus -> '*)
             playbackstatus="${dbus_read#playbackstatus -> }"
             if [[ "$playbackstatus" != "Playing" ]]; then
-                stop_current_recording
+                stop_current_recording "drain"
                 active_recording_signature=""
                 wait_for_any_key_then_exit "Playback is '$playbackstatus'. Session finished."
             else
@@ -900,6 +984,9 @@ handle_keypress () {
     fi
 
     case "$key" in
+        q|Q)
+            should_exit=1
+            ;;
         c|C)
             open_config_menu
             ;;
@@ -909,14 +996,34 @@ handle_keypress () {
     esac
 }
 
+remove_null_sink () {
+    local module_id
+
+    if [[ "$created_null_sink" == "true" ]] && [[ -n "$nullsink_module_id" ]]; then
+        pactl unload-module "$nullsink_module_id" 2>/dev/null || true
+    fi
+
+    # Defensively unload any null sink still matching our name so the virtual
+    # device never stays active after the session ends (including leftovers
+    # from a previous crashed run).
+    while IFS= read -r module_id; do
+        [[ -n "$module_id" ]] || continue
+        pactl unload-module "$module_id" 2>/dev/null || true
+    done < <(pactl list short modules 2>/dev/null \
+        | grep 'module-null-sink' \
+        | grep "sink_name=$nulloutput_name" \
+        | cut -f1)
+
+    created_null_sink=false
+    nullsink_module_id=""
+}
+
 cleanup () {
     stop_current_recording
     if [[ -n "$dbus_monitor_pid" ]] && kill -0 "$dbus_monitor_pid" 2>/dev/null; then
         kill "$dbus_monitor_pid" 2>/dev/null || true
     fi
-    if [[ "$created_null_sink" == "true" ]] && [[ -n "$nullsink_module_id" ]]; then
-        pactl unload-module "$nullsink_module_id" 2>/dev/null || true
-    fi
+    remove_null_sink
     printf '\033[0m\n'
 }
 
@@ -1082,6 +1189,7 @@ main () {
     load_config
     get_options "$@"
     validate_settings
+    check_encoder_dependency
     if [[ "$no_intro" != "true" ]]; then
         show_startup_info
     fi
@@ -1106,12 +1214,12 @@ main () {
             ;;
     esac
 
+    trap cleanup EXIT INT TERM
+
     create_null_audio_output
     move_target_output
     tui_set "state" "monitoring"
     tui_set "message" "Monitoring MPRIS metadata. If playback shows Unknown, start playback or switch to another track to emit metadata."
-
-    trap cleanup EXIT INT TERM
 
     coproc DBUS_MONITOR { get_dbusmessages "path=/org/mpris/MediaPlayer2,member=PropertiesChanged"; }
     dbus_monitor_pid=$!
