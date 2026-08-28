@@ -44,7 +44,7 @@ no_intro=false
 sink_app_name="spotify"
 nulloutput_name="loopcatcher"
 aac_profile="29"
-bitrate="64"
+bitrate="48"
 record_format="aac"
 filename_scheme="normal"
 output_directory=""
@@ -599,7 +599,7 @@ open_config_menu () {
         printf '  \033[1m1\033[0m  record_format       %s\n' "$record_format"
         printf '     \033[2mOutput codec. aac → .m4a, ogg → .oga\033[0m\n'
         printf '  \033[1m2\033[0m  bitrate             %s\n' "$bitrate"
-        printf '     \033[2mEncoding bitrate in kbps. e.g. 64 (AAC HE v2), 128 (OGG)\033[0m\n'
+        printf '     \033[2mEncoding bitrate in kbps. e.g. 48 (AAC HE v2); raise to 128+ for OGG\033[0m\n'
         printf '  \033[1m3\033[0m  aac_profile         %s\n' "$aac_profile"
         printf '     \033[2mfdkaac profile (used only when record_format=aac)\033[0m\n'
         printf '  \033[1m4\033[0m  filename_scheme     %s\n' "$filename_scheme"

@@ -9,7 +9,6 @@ Generic Linux audio loopback capture tool for recording app/system playback to A
 - Interactive TUI for session setup, live status, and runtime config edits.
 - Per-session output folders (`output_directory/session_name`) to avoid accidental overwrite.
 - XDG config support at `~/.config/loopcatcher/config`.
-- Debian packaging metadata and GitHub Actions workflow for release artifacts.
 
 ## Dependencies
 - `pactl` (PulseAudio or PipeWire with pulse compatibility)
@@ -82,7 +81,7 @@ On exit the virtual `nulloutput_name` sink is unloaded, so it never stays active
 
 Main keys:
 - `record_format` (`aac` or `ogg`)
-- `bitrate` (kbps; default `64`)
+- `bitrate` (kbps; default `48`)
 - `aac_profile`
 - `filename_scheme` (`normal`, `strict`, `strict-lc-nodir`) — `normal` keeps Unicode
   letters (accents, non-Latin scripts) and only strips path-unsafe / FAT/NTFS-reserved
@@ -92,6 +91,10 @@ Main keys:
 - `nulloutput_name`
 - `tail_drain_seconds` (extra capture time after playback stops; `0` disables)
 - `debug`
+
+> **Note:** the default `bitrate` of `48` is tuned for AAC (HE-AAC v2). OGG/Vorbis
+> sounds poor at that rate — if you set `record_format=ogg`, raise `bitrate` in the
+> config (e.g. `128` or higher) as well.
 
 Only one artist is used for tagging and the folder tree (multi-artist tracks would
 otherwise explode into a huge folder/file structure).
