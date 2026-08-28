@@ -1,4 +1,4 @@
-loopcatcher (0.1.3-1) unstable; urgency=medium
+loopcatcher (0.1.4-1) unstable; urgency=medium
 
   * First release as loopcatcher.
   * Generic loopback audio capture positioning and documentation.

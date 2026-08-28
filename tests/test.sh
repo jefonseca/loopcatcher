@@ -87,12 +87,54 @@ test_pause_stops_session () {
         tui_render () { :; }
         # shellcheck disable=SC2317
         stop_current_recording () { :; }
+        started_playing=true
         playbackstatus="Playing"
         process_dbus_line "playbackstatus -> Paused"
         printf '%s|%s|%s' "$exit_on_any_key" "$tui_state" "$tui_hint"
     })"
 
     [[ "$out" == "true|session-ended|Press any key to exit" ]]
+}
+
+test_pause_before_first_play_does_not_exit () {
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        # shellcheck disable=SC2317
+        tui_render () { :; }
+        # shellcheck disable=SC2317
+        stop_current_recording () { :; }
+        started_playing=false
+        process_dbus_line "playbackstatus -> Paused"
+        printf '%s|%s' "$exit_on_any_key" "$should_exit"
+    })"
+
+    [[ "$out" == "false|0" ]]
+}
+
+test_normal_scheme_keeps_unicode () {
+    local out
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+
+    # shellcheck disable=SC2034
+    out="$({ source "$SCRIPT_PATH"; session_output_directory="$tmpdir"; filename_scheme="normal"; file_path_structure "Sigur Rós" "Ágætis byrjun" "Starálfur" "m4a"; })"
+    rm -rf "$tmpdir"
+
+    [[ "$out" == *"/Sigur Rós/Ágætis byrjun/Starálfur.m4a" ]]
+}
+
+test_normal_scheme_strips_path_chars () {
+    local out
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+
+    # shellcheck disable=SC2034
+    out="$({ source "$SCRIPT_PATH"; session_output_directory="$tmpdir"; filename_scheme="normal"; file_path_structure "AC/DC" "Album:1" "Song?" "m4a"; })"
+    rm -rf "$tmpdir"
+
+    [[ "$out" == *"/AC_DC/Album_1/Song_.m4a" ]]
 }
 
 test_track_change_resets_metadata () {
@@ -116,6 +158,44 @@ test_track_change_resets_metadata () {
     [[ "$out" == "|||" ]]
 }
 
+test_stop_recording_cleans_up () {
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        # shellcheck disable=SC2317
+        tui_render () { :; }
+        record_fifo_dir="$(mktemp -d)"
+        record_error_log="$(mktemp)"
+        fifo_dir_before="$record_fifo_dir"
+        log_before="$record_error_log"
+        parec_pid=""
+        encoder_pid=""
+        stop_current_recording
+        [[ -e "$fifo_dir_before" ]] && printf 'FIFO_LEFT '
+        [[ -e "$log_before" ]] && printf 'LOG_LEFT '
+        printf '%s|%s|%s' "$record_fifo_dir" "$record_error_log" "$stopping_recording"
+    })"
+
+    [[ "$out" == "||false" ]]
+}
+
+test_q_key_requests_exit () {
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        # shellcheck disable=SC2317
+        tui_render () { :; }
+        should_exit=0
+        exit_on_any_key=false
+        handle_keypress "q"
+        printf '%s' "$should_exit"
+    })"
+
+    [[ "$out" == "1" ]]
+}
+
 run_test () {
     local name="$1"
     if "$name"; then
@@ -133,7 +213,12 @@ main () {
     run_test test_invalid_scheme_rejected
     run_test test_file_path_structure_and_uniqueness
     run_test test_pause_stops_session
+    run_test test_pause_before_first_play_does_not_exit
     run_test test_track_change_resets_metadata
+    run_test test_normal_scheme_keeps_unicode
+    run_test test_normal_scheme_strips_path_chars
+    run_test test_stop_recording_cleans_up
+    run_test test_q_key_requests_exit
 
     printf '\nTests: %s passed, %s failed\n' "$pass_count" "$fail_count"
 

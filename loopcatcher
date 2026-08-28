@@ -18,15 +18,24 @@ tui_track="-"
 tui_artist="-"
 tui_album="-"
 tui_output="-"
-tui_hint="Keys: c config menu | r reload config | Ctrl+C exit"
+tui_hint="q quit  ·  c config  ·  r reload"
+tui_cols=80
+tui_frame=0
+tui_spinner=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+tui_screen_active=false
 
 source_sink_index=""
 created_null_sink=false
 nullsink_module_id=""
 should_exit=0
-recorder_pid=""
+started_playing=false
+parec_pid=""
+encoder_pid=""
+record_fifo_dir=""
+stopping_recording=false
 dbus_monitor_pid=""
 record_error_log=""
+exit_note=""
 show_help=false
 show_version=false
 exit_on_any_key=false
@@ -35,10 +44,16 @@ no_intro=false
 sink_app_name="spotify"
 nulloutput_name="loopcatcher"
 aac_profile="29"
-bitrate="48"
+bitrate="64"
 record_format="aac"
 filename_scheme="normal"
 output_directory=""
+# Extra capture time (seconds) kept running after the player reports
+# pause/stop, so the audio tail still moving through the
+# sink -> parec -> pipe -> encoder chain is written instead of cut.
+# Trade-off: up to this much near-silence at the end of the last track.
+# 0 disables it. Editable from the config menu.
+tail_drain_seconds="0.35"
 
 session_name=""
 session_output_directory=""
@@ -97,57 +112,146 @@ wait_for_any_key_then_exit () {
     tui_hint="Press any key to exit"
 }
 
+show_blocking_notice_and_exit () {
+    tui_set "state" "setup-required"
+    tui_set "message" "$1"
+    tui_hint="Press any key to exit"
+    read -rsn1 _ignore
+    exit 1
+}
+
 show_startup_info () {
-    printf '\033[H\033[2J'
-    printf 'loopcatcher v%s\n\n' "$SCRIPT_VERSION"
-    printf 'What this session will do:\n'
-    printf ' - Capture app/system audio through Linux loopback monitor sink\n'
-    printf ' - Save files under output_directory/session_name\n'
-    printf ' - Stop session automatically when playback is paused/stopped\n\n'
-    printf 'TUI shortcuts:\n'
-    printf ' - c : open config menu\n'
-    printf ' - r : reload config file\n'
-    printf ' - Ctrl+C : exit safely\n\n'
-    printf 'Press Enter to continue...'
+    tui_measure_cols
+    tui_page_header "welcome"
+
+    printf ' This session will:\n'
+    printf '   🎙️  Capture app/system audio through a Linux loopback monitor sink\n'
+    printf '   💾  Save files under  output_directory/session_name\n'
+    printf '   ⏹️  Stop automatically as soon as playback pauses or stops\n'
+    tui_hr
+    printf ' Recommended flow:\n'
+    printf '   \033[1m1\033[0m  Play any track once in your player (creates the sink)\n'
+    printf '   \033[1m2\033[0m  Pause, then select the first track you want to record\n'
+    printf '   \033[1m3\033[0m  Launch loopcatcher (this screen) while still paused\n'
+    printf '   \033[1m4\033[0m  Press Play — recording starts on the metadata refresh\n'
+    tui_hr
+    printf '   \033[1;33m⚠\033[0m  \033[2mOnce playing, ANY pause/stop ends the session (no half\n'
+    printf '      tracks) — also where Spotify lands when a playlist ends.\033[0m\n'
+    tui_hr
+    printf '   \033[2mKeys:\033[0m  c config   \033[2m·\033[0m   r reload   \033[2m·\033[0m   q quit\n'
+    tui_hr_heavy
+    printf ' \033[2m›\033[0m Press Enter to continue… '
     read -r _ignore
 }
 
-tui_pad () {
-    local text="$1"
-    local width="$2"
-    printf "%-${width}s" "$text"
+tui_measure_cols () {
+    tui_cols="$(tput cols 2>/dev/null || echo 80)"
+    { [[ "$tui_cols" =~ ^[0-9]+$ ]] && [[ "$tui_cols" -ge 40 ]]; } || tui_cols=80
+}
+
+tui_enter_screen () {
+    tui_measure_cols
+    tui_screen_active=true
+    # Alternate screen buffer + hidden cursor: no scrollback pollution and a
+    # clean, fl"icker-free surface to repaint in place.
+    printf '\033[?1049h\033[?25l'
+}
+
+tui_leave_screen () {
+    if [[ "$tui_screen_active" == "true" ]]; then
+        printf '\033[?25h\033[?1049l'
+        tui_screen_active=false
+    fi
+}
+
+tui_resize () {
+    tui_measure_cols
+    tui_render
+}
+
+# Shared chrome for the full-screen sub-pages (onboarding, prompts, menus)
+# so they carry the same look as the recording dashboard.
+tui_hr () {
+    local w="$tui_cols" rule
+    [[ "$w" -ge 40 ]] 2>/dev/null || w=40
+    printf -v rule '%*s' "$w" ''
+    printf '\033[36m%s\033[0m\n' "${rule// /─}"
+}
+
+tui_hr_heavy () {
+    local w="$tui_cols" rule
+    [[ "$w" -ge 40 ]] 2>/dev/null || w=40
+    printf -v rule '%*s' "$w" ''
+    printf '\033[1;36m%s\033[0m\n' "${rule// /━}"
+}
+
+tui_page_header () {
+    local subtitle="${1:-}"
+    local w="$tui_cols" rule
+    [[ "$w" -ge 40 ]] 2>/dev/null || w=40
+    printf -v rule '%*s' "$w" ''
+    printf '\033[H\033[2J'
+    printf '\033[1;36m%s\033[0m\n' "${rule// /━}"
+    if [[ -n "$subtitle" ]]; then
+        printf ' \033[1m🎧 loopcatcher\033[0m \033[2m·\033[0m %s   \033[2mv%s\033[0m\n' "$subtitle" "$SCRIPT_VERSION"
+    else
+        printf ' \033[1m🎧 loopcatcher\033[0m   \033[2mv%s\033[0m\n' "$SCRIPT_VERSION"
+    fi
+    printf '\033[1;36m%s\033[0m\n' "${rule// /━}"
 }
 
 tui_render () {
-    local cols=90
-    local current_cols
-    local border
+    local w="$tui_cols"
+    local rule_heavy rule_light state_disp play_disp spin msg_prefix out
+    local esc=$'\033'
+    local eol=$'\033[K\n'
+    local cyan=$'\033[1;36m' dim=$'\033[2m' rst=$'\033[0m'
 
-    current_cols=$(tput cols 2>/dev/null || true)
-    if [[ -n "$current_cols" ]] && [[ "$current_cols" -ge 70 ]] 2>/dev/null; then
-        cols="$current_cols"
-    fi
-    border=$(printf '%*s' "$cols" '' | tr ' ' '=')
+    [[ "$w" -ge 40 ]] 2>/dev/null || w=40
+    printf -v rule_heavy '%*s' "$w" ''
+    rule_heavy="${rule_heavy// /━}"
+    printf -v rule_light '%*s' "$w" ''
+    rule_light="${rule_light// /─}"
 
-    printf '\033[H\033[2J'
-    printf '\033[1;36m%s\033[0m\n' "$border"
-    printf '\033[1;36m%s\033[0m\n' "$(tui_pad " loopcatcher | state: $tui_state | playback: $playbackstatus " "$cols")"
-    printf '%s\n' "$border"
-    printf ' Track      : %s\n' "${tui_track:- -}"
-    printf ' Artist     : %s\n' "${tui_artist:- -}"
-    printf ' Album      : %s\n' "${tui_album:- -}"
-    printf ' Sink       : %s\n' "${source_sink_index:--}"
-    printf ' Session    : %s\n' "${session_name:--}"
-    printf ' Output dir : %s\n' "${session_output_directory:--}"
-    printf ' File       : %s\n' "$tui_output"
-    printf ' Config     : %s\n' "$config_path"
-    printf '%s\n' "$border"
-    printf ' %s\n' "$tui_last_message"
-    printf ' %s\n' "$tui_hint"
+    spin="${tui_spinner[tui_frame % ${#tui_spinner[@]}]}"
+    case "$tui_state" in
+        recording)      state_disp="${esc}[1;32m⏺ recording${rst} ${spin}" ; msg_prefix="${spin}  " ;;
+        monitoring)     state_disp="${dim}◌ monitoring${rst}" ; msg_prefix="${dim}·${rst}  " ;;
+        session-ended)  state_disp="${esc}[1;33m⏹ session ended${rst}" ; msg_prefix="${dim}·${rst}  " ;;
+        setup-required) state_disp="${esc}[1;31m⚠ setup required${rst}" ; msg_prefix="${dim}·${rst}  " ;;
+        *)              state_disp="${dim}… ${tui_state}${rst}" ; msg_prefix="${dim}·${rst}  " ;;
+    esac
+
+    case "$playbackstatus" in
+        Playing) play_disp="${esc}[32m▶${rst} Playing" ;;
+        Paused)  play_disp='⏸ Paused' ;;
+        Stopped) play_disp='■ Stopped' ;;
+        *)       play_disp="• ${playbackstatus}" ;;
+    esac
+
+    out="${esc}[H"
+    out+="${cyan}${rule_heavy}${rst}${eol}"
+    out+=" 🎧  ${esc}[1mloopcatcher${rst}  ${dim}v${SCRIPT_VERSION}${rst}${eol}"
+    out+=" ${state_disp}      ${play_disp}${eol}"
+    out+="${esc}[36m${rule_light}${rst}${eol}"
+    out+=" 🎵  Track    ${tui_track:--}${eol}"
+    out+=" 🎤  Artist   ${tui_artist:--}${eol}"
+    out+=" 💿  Album    ${tui_album:--}${eol}"
+    out+=" 🎯  Sink     ${source_sink_index:--}${eol}"
+    out+=" 📇  Session  ${session_name:--}${eol}"
+    out+=" 📂  Folder   ${session_output_directory:--}${eol}"
+    out+=" 💾  File     ${tui_output:--}${eol}"
+    out+=" 🔧  Config   ${config_path}${eol}"
+    out+="${esc}[36m${rule_light}${rst}${eol}"
+    out+=" ${msg_prefix}${tui_last_message}${eol}"
+    out+="${esc}[36m${rule_light}${rst}${eol}"
+    out+=" ${dim}${tui_hint}${rst}${eol}"
+    out+="${esc}[J"
+    printf '%s' "$out"
 }
 
 check_dependencies () {
-    local requirements='tr killall dbus-monitor pactl parec fdkaac oggenc tput'
+    local requirements='tr dbus-monitor pactl parec tput mktemp mkfifo awk'
     local req
     for req in $requirements; do
         if ! command -v "$req" >/dev/null 2>&1; then
@@ -155,6 +259,19 @@ check_dependencies () {
             exit 1
         fi
     done
+}
+
+check_encoder_dependency () {
+    local tool
+    case "$record_format" in
+        aac) tool="fdkaac" ;;
+        ogg) tool="oggenc" ;;
+        *) return ;;
+    esac
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf 'FATAL: "%s" is required for record_format=%s but was not found\n' "$tool" "$record_format"
+        exit 1
+    fi
 }
 
 ensure_config_dir () {
@@ -189,6 +306,7 @@ bitrate="$bitrate"
 record_format="$record_format"
 filename_scheme="$filename_scheme"
 output_directory="$output_directory"
+tail_drain_seconds="$tail_drain_seconds"
 EOF
 }
 
@@ -222,6 +340,11 @@ validate_settings () {
 
     if [[ ! "$aac_profile" =~ ^[0-9]+$ ]] || [[ "$aac_profile" -le 0 ]]; then
         printf 'Invalid aac_profile: %s (must be a positive integer)\n' "$aac_profile"
+        exit 1
+    fi
+
+    if [[ ! "$tail_drain_seconds" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        printf 'Invalid tail_drain_seconds: %s (must be a non-negative number, e.g. 0.35)\n' "$tail_drain_seconds"
         exit 1
     fi
 
@@ -259,10 +382,11 @@ browse_directory () {
         current="$HOME"
     fi
 
+    tui_measure_cols
     while true; do
-        printf '\033[H\033[2J'
-        printf 'Directory browser\n'
-        printf 'Current: %s\n\n' "$current"
+        tui_page_header "directory browser"
+        printf ' 📂  %s\n' "$current"
+        tui_hr
 
         options=()
         shopt -s nullglob dotglob
@@ -272,17 +396,18 @@ browse_directory () {
         shopt -u nullglob dotglob
 
         if [[ ${#options[@]} -eq 0 ]]; then
-            printf 'No subdirectories found here.\n'
+            printf ' \033[2m(no subdirectories here)\033[0m\n'
         else
             idx=1
             for selected in "${options[@]}"; do
-                printf '%s) %s\n' "$idx" "$(basename "$selected")"
+                printf '  \033[1m%2s\033[0m  %s/\n' "$idx" "$(basename "$selected")"
                 idx=$((idx + 1))
             done
         fi
 
-        printf '\nCommands: number=open, u=up, s=select, q=cancel\n'
-        printf 'Choose: '
+        tui_hr_heavy
+        printf ' \033[2mnumber\033[0m open   \033[2mu\033[0m up   \033[2ms\033[0m select here   \033[2mq\033[0m cancel\n'
+        printf ' \033[2m›\033[0m Choose: '
         read -r choice
 
         case "$choice" in
@@ -349,15 +474,19 @@ initialize_output_directory () {
 choose_output_directory () {
     local choice=""
     local selected=""
-    printf '\nOutput directory setup\n'
-    printf '1) Type path manually\n'
-    printf '2) Browse directories\n'
-    printf 'Choose: '
+    tui_measure_cols
+    tui_page_header "output directory"
+    printf ' 📂  Current   %s\n' "$output_directory"
+    tui_hr
+    printf '  \033[1m1\033[0m  Type a path manually\n'
+    printf '  \033[1m2\033[0m  Browse directories\n'
+    tui_hr_heavy
+    printf ' \033[2m›\033[0m Choose: '
     read -r choice
 
     case "$choice" in
         1)
-            printf 'Path: '
+            printf ' \033[2m›\033[0m Path: '
             read -r selected
             if [[ -n "$selected" ]]; then
                 output_directory="$selected"
@@ -399,30 +528,23 @@ prompt_session_name () {
         return
     fi
 
+    tui_measure_cols
     while true; do
-        printf '\033[H\033[2J'
-        printf '============================================================\n'
-        printf ' loopcatcher session setup\n'
-        printf '============================================================\n\n'
-        printf ' Base output folder:\n'
-        printf '   %s\n\n' "$output_directory"
-        printf ' Session name info:\n'
-        printf '   - Identifies this run as one unique capture session\n'
-        printf '   - Files are saved under: output_directory/session_name\n'
-        printf '   - Tip: use date-purpose, e.g. 2026-08-27-album\n\n'
-        printf ' Reminder:\n'
-        printf '   Disable these playback options in your player software:\n'
-        printf '   - Autoplay\n'
-        printf '   - Crossfade Songs\n'
-        printf '   - Gapless\n'
-        printf '   All three should be disabled so the session can end cleanly\n'
-        printf '   when playlist/album playback finishes.\n\n'
-        printf '============================================================\n'
+        tui_page_header "session setup"
+        printf ' 📂  Base folder   %s\n' "$output_directory"
+        tui_hr
+        printf ' 📇  Session name\n'
+        printf '     \033[2m·\033[0m groups this run under  output_directory/session_name\n'
+        printf '     \033[2m·\033[0m tip: date-purpose, e.g. 2026-08-28-album\n'
+        tui_hr
+        printf ' \033[1;33m⚠\033[0m  \033[2mDisable in your player so the session can end cleanly\n'
+        printf '    when the playlist/album ends:\033[0m  Autoplay \033[2m·\033[0m Crossfade \033[2m·\033[0m Gapless\n'
+        tui_hr_heavy
         if [[ -n "$validation_error" ]]; then
-            printf ' Warning: %s\n' "$validation_error"
-            printf -- '------------------------------------------------------------\n'
+            printf ' \033[1;31m✗\033[0m %s\n' "$validation_error"
+            tui_hr
         fi
-        printf 'Enter session name (required): '
+        printf ' \033[2m›\033[0m Enter session name (required): '
         read -r value
 
         if [[ -z "$value" ]]; then
@@ -455,7 +577,7 @@ config_prompt_value () {
     local current_value
     local new_value=""
     current_value="${!var_name}"
-    printf '%s [%s]: ' "$label" "$current_value"
+    printf ' \033[2m›\033[0m %s \033[2m[%s]\033[0m: ' "$label" "$current_value"
     read -r new_value
     if [[ -n "$new_value" ]]; then
         printf -v "$var_name" '%s' "$new_value"
@@ -464,29 +586,38 @@ config_prompt_value () {
 
 open_config_menu () {
     local opt=""
+    local status=""
+    tui_measure_cols
     while true; do
-        printf '\033[H\033[2J'
-        printf 'loopcatcher config menu\n'
-        printf 'Config file: %s\n\n' "$config_path"
-        printf '1) record_format      : %s\n' "$record_format"
-        printf '   Output codec. aac gives .m4a, ogg gives .oga\n'
-        printf '2) bitrate            : %s\n' "$bitrate"
-        printf '   Encoding bitrate. Example: 48 (AAC HE v2), 128 (OGG)\n'
-        printf '3) aac_profile        : %s\n' "$aac_profile"
-        printf '   fdkaac profile (used only when record_format=aac)\n'
-        printf '4) filename_scheme    : %s\n' "$filename_scheme"
-        printf '   normal/strict/strict-lc-nodir naming rules\n'
-        printf '5) output_directory   : %s\n' "$output_directory"
-        printf '   Base folder where each session folder is created\n'
-        printf '6) sink_app_name      : %s\n' "$sink_app_name"
-        printf '   Target app name in audio sink (ex: spotify, com.spotify.Client)\n'
-        printf '7) nulloutput_name    : %s\n' "$nulloutput_name"
-        printf '   Virtual sink name used for monitor recording\n'
-        printf '8) debug              : %s\n' "$debug"
-        printf '   true/false to show internal debug logs\n\n'
-        printf 's) save\n'
-        printf 'x) exit menu\n\n'
-        printf 'Choose: '
+        tui_page_header "config"
+        printf ' 🔧  %s\n' "$config_path"
+        if [[ -n "$status" ]]; then
+            printf ' \033[1;32m%s\033[0m\n' "$status"
+            status=""
+        fi
+        tui_hr
+        printf '  \033[1m1\033[0m  record_format       %s\n' "$record_format"
+        printf '     \033[2mOutput codec. aac → .m4a, ogg → .oga\033[0m\n'
+        printf '  \033[1m2\033[0m  bitrate             %s\n' "$bitrate"
+        printf '     \033[2mEncoding bitrate in kbps. e.g. 64 (AAC HE v2), 128 (OGG)\033[0m\n'
+        printf '  \033[1m3\033[0m  aac_profile         %s\n' "$aac_profile"
+        printf '     \033[2mfdkaac profile (used only when record_format=aac)\033[0m\n'
+        printf '  \033[1m4\033[0m  filename_scheme     %s\n' "$filename_scheme"
+        printf '     \033[2mnormal (keeps Unicode) / strict / strict-lc-nodir\033[0m\n'
+        printf '  \033[1m5\033[0m  output_directory    %s\n' "$output_directory"
+        printf '     \033[2mBase folder where each session folder is created\033[0m\n'
+        printf '  \033[1m6\033[0m  sink_app_name       %s\n' "$sink_app_name"
+        printf '     \033[2mApp name in the audio sink (ex: spotify, com.spotify.Client)\033[0m\n'
+        printf '  \033[1m7\033[0m  nulloutput_name     %s\n' "$nulloutput_name"
+        printf '     \033[2mVirtual sink name used for monitor recording\033[0m\n'
+        printf '  \033[1m8\033[0m  debug               %s\n' "$debug"
+        printf '     \033[2mtrue/false to show internal debug logs\033[0m\n'
+        printf '  \033[1m9\033[0m  tail_drain_seconds  %s\n' "$tail_drain_seconds"
+        printf '     \033[2mExtra capture time after playback stops so the tail is not cut (0 = off)\033[0m\n'
+        tui_hr
+        printf '  \033[1ms\033[0m  save        \033[1mx\033[0m  save & exit\n'
+        tui_hr_heavy
+        printf ' \033[2m›\033[0m Choose: '
         read -r opt
 
         case "$opt" in
@@ -498,9 +629,10 @@ open_config_menu () {
             6) config_prompt_value "sink_app_name" "sink_app_name" ;;
             7) config_prompt_value "nulloutput_name" "nulloutput_name" ;;
             8) config_prompt_value "debug" "debug (true|false)" ;;
+            9) config_prompt_value "tail_drain_seconds" "tail_drain_seconds (seconds, e.g. 0.35)" ;;
             s)
                 save_config
-                msg "Config saved"
+                status="✓ saved"
                 ;;
             x)
                 save_config
@@ -513,9 +645,9 @@ open_config_menu () {
 
 check_audio_server () {
     if ! pactl info >/dev/null 2>&1; then
-        msg "FATAL: Cannot connect to PulseAudio/PipeWire session daemon"
-        msg "On KDE, ensure pipewire-pulse is running in your user session"
-        msg "Try: systemctl --user status pipewire pipewire-pulse wireplumber"
+        printf 'FATAL: cannot connect to the PulseAudio/PipeWire session daemon.\n' >&2
+        printf 'On KDE, ensure pipewire-pulse is running in your user session.\n' >&2
+        printf 'Try: systemctl --user status pipewire pipewire-pulse wireplumber\n' >&2
         exit 1
     fi
 }
@@ -541,8 +673,7 @@ get_target_sink_index () {
 
     sink_list="$(pactl list sink-inputs 2>/dev/null)"
     if [[ -z "$sink_list" ]]; then
-        msg "No sink-inputs found. Start playback in your target app first."
-        return 1
+        return 2
     fi
 
     while IFS= read -r line; do
@@ -558,25 +689,34 @@ get_target_sink_index () {
         fi
     done <<< "$sink_list"
 
-    msg "Target sink not found. Use 'c' to adjust sink_app_name if needed."
-    return 1
+    return 3
 }
 
 ensure_target_routed () {
+    # Fast path: reuse the cached sink-input id with a single cheap call.
+    # move-sink-input is idempotent, so this is a no-op when already routed.
+    if [[ -n "$source_sink_index" ]] \
+        && pactl move-sink-input "$source_sink_index" "$nulloutput_name" 2>/dev/null; then
+        return 0
+    fi
+
+    # Slow path: the player likely replaced its sink-input (e.g. on a track
+    # change) - rescan. Non-fatal so a transient failure does not kill the run.
     if ! get_target_sink_index; then
         return 1
     fi
-
-    move_target_output
+    if ! pactl move-sink-input "$source_sink_index" "$nulloutput_name" 2>/dev/null; then
+        msg "Could not move sink-input $source_sink_index to '$nulloutput_name'"
+        return 1
+    fi
     return 0
 }
 
 create_null_audio_output () {
     nullsink_module_id="$(pactl list short modules | grep "module-null-sink" | grep "sink_name=$nulloutput_name" | cut -f1 | head -n 1)"
     if [[ -z "$nullsink_module_id" ]]; then
-        nullsink_module_id="$(pactl load-module module-null-sink sink_name="$nulloutput_name")"
         if ! nullsink_module_id="$(pactl load-module module-null-sink sink_name="$nulloutput_name")"; then
-            msg "FATAL: Cannot create null sink '$nulloutput_name'"
+            printf 'FATAL: cannot create null sink "%s".\n' "$nulloutput_name" >&2
             exit 1
         fi
         created_null_sink=true
@@ -584,8 +724,8 @@ create_null_audio_output () {
 }
 
 move_target_output () {
-    if ! pactl move-sink-input "$source_sink_index" "$nulloutput_name"; then
-        msg "FATAL: Cannot move target sink to '$nulloutput_name'"
+    if ! pactl move-sink-input "$source_sink_index" "$nulloutput_name" 2>/dev/null; then
+        printf 'FATAL: cannot move sink-input %s to "%s".\n' "$source_sink_index" "$nulloutput_name" >&2
         exit 1
     fi
 }
@@ -596,6 +736,31 @@ sanitize_str () {
     elif [[ "$1" == "strict-lc" ]]; then
         tr -dc '[:alnum:]\n\r' <<< "$2" | tr '[:upper:]' '[:lower:]'
     fi
+}
+
+# Path component for the "normal" scheme: keep Unicode letters/marks intact,
+# only remove characters that are unsafe in a path or reserved on common
+# filesystems (so recordings to FAT/exFAT/NTFS drives still work).
+sanitize_component () {
+    local s="$1"
+    s="${s//\//_}"
+    s="${s//\\/_}"
+    s="${s//:/_}"
+    s="${s//\*/_}"
+    s="${s//\?/_}"
+    s="${s//\"/_}"
+    s="${s//</_}"
+    s="${s//>/_}"
+    s="${s//|/_}"
+    # Fold every whitespace kind (tab, newline, ...) to single spaces, then
+    # drop any remaining ASCII control chars. Byte-based, so UTF-8 multibyte
+    # sequences pass through untouched.
+    s="$(printf '%s' "$s" | tr -s '[:space:]' ' ')"
+    s="$(printf '%s' "$s" | tr -d '\000-\037\177')"
+    s="${s#"${s%%[![:space:].]*}"}"
+    s="${s%"${s##*[![:space:].]}"}"
+    [[ -n "$s" ]] || s="Unknown"
+    printf '%s' "$s"
 }
 
 unique_output_path () {
@@ -633,8 +798,8 @@ file_path_structure () {
 
     case "$filename_scheme" in
         normal)
-            outdir="$session_output_directory/${i_artist//[^ A-Za-z0-9._-]/}/${i_album//[^ A-Za-z0-9._-]/}"
-            outfile="${i_title//[^ A-Za-z0-9._-]/}.$extension"
+            outdir="$session_output_directory/$(sanitize_component "$i_artist")/$(sanitize_component "$i_album")"
+            outfile="$(sanitize_component "$i_title").$extension"
             ;;
         strict)
             outdir="$session_output_directory/$(sanitize_str "strict" "$i_artist")/$(sanitize_str "strict" "$i_album")"
@@ -716,7 +881,7 @@ get_dbusmessages () {
         fi
 
         if [[ "$expect_type" == "int32" ]] && [[ $line == *'int32 '* ]]; then
-            echo "$expect_key -> $(awk '{print substr($2,1)}' <<< "$line")"
+            echo "$expect_key -> $(awk '{print $2}' <<< "$line")"
             expect_key=""
             expect_type=""
             continue
@@ -724,19 +889,62 @@ get_dbusmessages () {
     done < <(dbus-monitor "$1")
 }
 
+# stop_current_recording [mode]
+#   quick (default) - track change / handoff: stop capture and return
+#     immediately; the encoder keeps running in the background, sees EOF
+#     (parec is gone), finalizes its file and exits on its own. This keeps
+#     track-to-track gaps as short as possible.
+#   drain           - session end: keep capturing for tail_drain_seconds so
+#     the in-flight audio tail is not cut, then stop capture and wait for the
+#     encoder to finish writing the file before returning.
 stop_current_recording () {
-    if [[ -n "$recorder_pid" ]] && kill -0 "$recorder_pid" 2>/dev/null; then
-        kill "$recorder_pid" 2>/dev/null || true
-    fi
-    killall fdkaac 2>/dev/null || true
-    killall oggenc 2>/dev/null || true
-    killall parec 2>/dev/null || true
-    recorder_pid=""
+    local mode="${1:-quick}"
+    local fifo_dir="$record_fifo_dir"
+    local old_encoder="$encoder_pid"
+    local old_parec="$parec_pid"
+    local waited=0
 
+    if [[ "$stopping_recording" == "true" ]]; then
+        return
+    fi
+    stopping_recording=true
+
+    if [[ "$mode" == "drain" ]] && [[ -n "$old_parec" ]] && kill -0 "$old_parec" 2>/dev/null; then
+        sleep "$tail_drain_seconds"
+    fi
+
+    # Stop capture first: the encoder then gets EOF and can flush its
+    # remaining frames and write a clean container trailer.
+    if [[ -n "$old_parec" ]] && kill -0 "$old_parec" 2>/dev/null; then
+        kill "$old_parec" 2>/dev/null || true
+    fi
+
+    parec_pid=""
+    encoder_pid=""
+    record_fifo_dir=""
+
+    if [[ "$mode" == "drain" ]] && [[ -n "$old_encoder" ]]; then
+        # Shutting down: wait for the encoder to finalize the file.
+        while kill -0 "$old_encoder" 2>/dev/null && [[ $waited -lt 60 ]]; do
+            sleep 0.05
+            waited=$((waited + 1))
+        done
+        if kill -0 "$old_encoder" 2>/dev/null; then
+            kill "$old_encoder" 2>/dev/null || true
+        fi
+    fi
+
+    # Safe to remove now: an unlinked FIFO / log stays valid for any encoder
+    # still finalizing in the background (its output file lives elsewhere).
+    if [[ -n "$fifo_dir" ]] && [[ -d "$fifo_dir" ]]; then
+        rm -rf "$fifo_dir"
+    fi
     if [[ -n "$record_error_log" ]] && [[ -f "$record_error_log" ]]; then
         rm -f "$record_error_log"
     fi
     record_error_log=""
+
+    stopping_recording=false
 }
 
 start_recording () {
@@ -747,6 +955,7 @@ start_recording () {
     local i_tracknumber="$5"
     local i_discnumber="$6"
     local outputfile=""
+    local record_fifo=""
 
     if [[ -z "$i_title" || -z "$i_artist" ]]; then
         return 1
@@ -761,32 +970,53 @@ start_recording () {
     fi
 
     record_error_log="$(mktemp)"
+    record_fifo_dir="$(mktemp -d)"
+    record_fifo="$record_fifo_dir/pcm"
+    if ! mkfifo "$record_fifo" 2>/dev/null; then
+        msg "Could not create capture pipe under $record_fifo_dir"
+        stop_current_recording
+        return 1
+    fi
 
+    # Start the encoder first (it blocks on the pipe until parec writes),
+    # then start capture. Keeping parec and the encoder as separately tracked
+    # processes lets us stop capture first on shutdown so the encoder can
+    # flush and finalize instead of being killed mid-stream.
     case "$record_format" in
         aac)
-            parec -d "$nulloutput_name.monitor" | fdkaac -R -S -p "$aac_profile" --bitrate "${bitrate}k" --moov-before-mdat --afterburner 1 \
-            --title "$i_title" --artist "$i_artist" --album "$i_album" --album-artist "$i_albumartist" --track "$i_tracknumber" --disk "$i_discnumber" \
-            - -o "$outputfile" 2>"$record_error_log" &
-            recorder_pid=$!
+            fdkaac -R -S -p "$aac_profile" --bitrate "${bitrate}k" --moov-before-mdat --afterburner 1 \
+                --title "$i_title" --artist "$i_artist" --album "$i_album" --album-artist "$i_albumartist" \
+                --track "$i_tracknumber" --disk "$i_discnumber" \
+                - -o "$outputfile" < "$record_fifo" 2>"$record_error_log" &
+            encoder_pid=$!
             ;;
         ogg)
-            parec -d "$nulloutput_name.monitor" | oggenc -b "$bitrate" --raw \
-            --title "$i_title" --artist "$i_artist" --album "$i_album" --tracknum "$i_tracknumber" \
-            - -o "$outputfile" 2>"$record_error_log" &
-            recorder_pid=$!
+            oggenc -b "$bitrate" --raw \
+                --title "$i_title" --artist "$i_artist" --album "$i_album" --tracknum "$i_tracknumber" \
+                - -o "$outputfile" < "$record_fifo" 2>"$record_error_log" &
+            encoder_pid=$!
             ;;
         *)
             msg "Invalid record_format '$record_format'"
+            stop_current_recording
             return 1
             ;;
     esac
 
+    # Low capture latency keeps less audio stranded in the server buffer, so
+    # both the start and the drained tail track the real playback closely.
+    parec -d "$nulloutput_name.monitor" --latency-msec=30 > "$record_fifo" 2>>"$record_error_log" &
+    parec_pid=$!
+
     sleep 0.2
-    if ! kill -0 "$recorder_pid" 2>/dev/null; then
+    if ! kill -0 "$parec_pid" 2>/dev/null || ! kill -0 "$encoder_pid" 2>/dev/null; then
         local err=""
         if [[ -s "$record_error_log" ]]; then
             err="$(tr '\n' ' ' < "$record_error_log")"
         fi
+        kill "$parec_pid" "$encoder_pid" 2>/dev/null || true
+        stop_current_recording
+        [[ -n "$outputfile" ]] && rm -f "$outputfile"
         if [[ -n "$err" ]]; then
             msg "Recorder failed to start: $err"
         else
@@ -828,12 +1058,17 @@ process_dbus_line () {
     case "$dbus_read" in
         'playbackstatus -> '*)
             playbackstatus="${dbus_read#playbackstatus -> }"
-            if [[ "$playbackstatus" != "Playing" ]]; then
-                stop_current_recording
+            if [[ "$playbackstatus" == "Playing" ]]; then
+                started_playing=true
+                maybe_start_recording
+            elif [[ "$started_playing" == "true" ]]; then
+                # Any non-Playing state after playback began ends the session:
+                # no half tracks, and this is where Spotify lands when a
+                # playlist finishes. A pause during setup (before the first
+                # Playing) is ignored so it does not abort prematurely.
+                stop_current_recording "drain"
                 active_recording_signature=""
                 wait_for_any_key_then_exit "Playback is '$playbackstatus'. Session finished."
-            else
-                maybe_start_recording
             fi
             ;;
         'trackid -> '*)
@@ -889,6 +1124,9 @@ handle_keypress () {
     fi
 
     case "$key" in
+        q|Q)
+            should_exit=1
+            ;;
         c|C)
             open_config_menu
             ;;
@@ -898,15 +1136,42 @@ handle_keypress () {
     esac
 }
 
-cleanup () {
-    stop_current_recording
-    if [[ -n "$dbus_monitor_pid" ]] && kill -0 "$dbus_monitor_pid" 2>/dev/null; then
-        kill "$dbus_monitor_pid" 2>/dev/null || true
-    fi
+remove_null_sink () {
+    local module_id
+
     if [[ "$created_null_sink" == "true" ]] && [[ -n "$nullsink_module_id" ]]; then
         pactl unload-module "$nullsink_module_id" 2>/dev/null || true
     fi
+
+    # Defensively unload any null sink still matching our name so the virtual
+    # device never stays active after the session ends (including leftovers
+    # from a previous crashed run).
+    while IFS= read -r module_id; do
+        [[ -n "$module_id" ]] || continue
+        pactl unload-module "$module_id" 2>/dev/null || true
+    done < <(pactl list short modules 2>/dev/null \
+        | grep 'module-null-sink' \
+        | grep "sink_name=$nulloutput_name" \
+        | cut -f1)
+
+    created_null_sink=false
+    nullsink_module_id=""
+}
+
+cleanup () {
+    # "drain" so a manual quit mid-track still finalizes the current file.
+    # After an automatic session end the pids are already cleared, so this
+    # is a cheap no-op.
+    stop_current_recording "drain"
+    if [[ -n "$dbus_monitor_pid" ]] && kill -0 "$dbus_monitor_pid" 2>/dev/null; then
+        kill "$dbus_monitor_pid" 2>/dev/null || true
+    fi
+    remove_null_sink
+    tui_leave_screen
     printf '\033[0m\n'
+    if [[ -n "$exit_note" ]]; then
+        printf '%s\n' "$exit_note" >&2
+    fi
 }
 
 get_options () {
@@ -919,6 +1184,12 @@ Behavior:
   - Session name is required every run (interactive prompt if not provided with --session).
   - Output goes to: output-directory/session-name
   - Session auto-finishes when playback becomes pause/stop.
+
+Recommended playback flow:
+  1) Open your player and play any track once (creates sink)
+  2) Pause playback
+  3) Switch to the first track you want to record
+  4) Start playback (metadata refresh triggers recording)
 
 Options:
   --debug                   Enable debug
@@ -1065,42 +1336,75 @@ main () {
     load_config
     get_options "$@"
     validate_settings
+    check_encoder_dependency
+    tui_measure_cols
     if [[ "$no_intro" != "true" ]]; then
         show_startup_info
     fi
-    tui_render
 
     initialize_output_directory
     prompt_session_name
     check_audio_server
 
-    if ! get_target_sink_index; then
-        exit 1
-    fi
+    get_target_sink_index
+    case $? in
+        0)
+            ;;
+        2)
+            show_blocking_notice_and_exit "No active sink-input found. Open your player, start playback, then run again."
+            ;;
+        3)
+            show_blocking_notice_and_exit "Sink-input exists but no app matched sink_app_name='$sink_app_name'. Open config menu (c) to adjust it."
+            ;;
+        *)
+            show_blocking_notice_and_exit "Could not detect target sink."
+            ;;
+    esac
+
+    trap cleanup EXIT
+    trap 'should_exit=1' INT TERM
 
     create_null_audio_output
     move_target_output
-    tui_set "state" "monitoring"
-    tui_set "message" "Monitoring app/player MPRIS events..."
 
-    trap cleanup EXIT INT TERM
+    tui_enter_screen
+    trap 'tui_resize' WINCH
+
+    tui_set "state" "monitoring"
+    tui_set "message" "Monitoring MPRIS metadata. If playback shows Unknown, start playback or switch to another track to emit metadata."
 
     coproc DBUS_MONITOR { get_dbusmessages "path=/org/mpris/MediaPlayer2,member=PropertiesChanged"; }
     dbus_monitor_pid=$!
 
+    local got_line idle_timeout
     while [[ $should_exit -eq 0 ]]; do
+        got_line=0
+        # read() returns the instant a line is ready regardless of the
+        # timeout, so a whole metadata burst is still consumed back-to-back
+        # (no keypad stall between lines) and recording starts fast. The
+        # timeout only paces the idle wait: tight while recording so the
+        # spinner animates, relaxed otherwise to stay light on the CPU.
+        idle_timeout=0.2
+        [[ "$tui_state" == "recording" ]] && idle_timeout=0.05
         if [[ "$exit_on_any_key" != "true" ]]; then
-            if IFS= read -r -t 0.20 -u "${DBUS_MONITOR[0]}" dbus_read; then
+            if IFS= read -r -t "$idle_timeout" -u "${DBUS_MONITOR[0]}" dbus_read; then
                 process_dbus_line "$dbus_read"
+                got_line=1
             fi
         fi
 
-        if IFS= read -rsn1 -t 0.05 key; then
-            handle_keypress "$key"
+        if [[ $got_line -eq 0 ]]; then
+            if IFS= read -rsn1 -t 0.05 key; then
+                handle_keypress "$key"
+            fi
+            if [[ "$tui_state" == "recording" ]]; then
+                tui_frame=$((tui_frame + 1))
+                tui_render
+            fi
         fi
 
         if [[ "$exit_on_any_key" != "true" ]] && ! kill -0 "$dbus_monitor_pid" 2>/dev/null; then
-            msg "dbus-monitor ended. Exiting..."
+            exit_note="loopcatcher: dbus-monitor ended, session stopped."
             break
         fi
     done
