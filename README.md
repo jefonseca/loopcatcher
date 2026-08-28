@@ -44,6 +44,12 @@ You can provide runtime overrides:
 ./loopcatcher --output /path/to/output --session my-session
 ```
 
+Recommended playback flow:
+1. Open your player software and play any track once (this creates the sink-input).
+2. Pause playback.
+3. Switch to the first track you actually want to record.
+4. Start playback (the metadata refresh triggers recording correctly).
+
 ## TUI controls
 - `c` open config menu
 - `r` reload config from disk

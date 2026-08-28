@@ -97,6 +97,14 @@ wait_for_any_key_then_exit () {
     tui_hint="Press any key to exit"
 }
 
+show_blocking_notice_and_exit () {
+    tui_set "state" "setup-required"
+    tui_set "message" "$1"
+    tui_hint="Press any key to exit"
+    read -rsn1 _ignore
+    exit 1
+}
+
 show_startup_info () {
     printf '\033[H\033[2J'
     printf 'loopcatcher v%s\n\n' "$SCRIPT_VERSION"
@@ -104,6 +112,11 @@ show_startup_info () {
     printf ' - Capture app/system audio through Linux loopback monitor sink\n'
     printf ' - Save files under output_directory/session_name\n'
     printf ' - Stop session automatically when playback is paused/stopped\n\n'
+    printf 'Recommended playback flow:\n'
+    printf ' 1) Open your player and play any track once (creates sink)\n'
+    printf ' 2) Pause playback\n'
+    printf ' 3) Switch to the first track you want to record\n'
+    printf ' 4) Start playback (metadata refresh triggers recording)\n\n'
     printf 'TUI shortcuts:\n'
     printf ' - c : open config menu\n'
     printf ' - r : reload config file\n'
@@ -143,6 +156,7 @@ tui_render () {
     printf ' Config     : %s\n' "$config_path"
     printf '%s\n' "$border"
     printf ' %s\n' "$tui_last_message"
+    printf '%s\n' "$(printf '%*s' "$cols" '' | tr ' ' '-')"
     printf ' %s\n' "$tui_hint"
 }
 
@@ -541,8 +555,7 @@ get_target_sink_index () {
 
     sink_list="$(pactl list sink-inputs 2>/dev/null)"
     if [[ -z "$sink_list" ]]; then
-        msg "No sink-inputs found. Start playback in your target app first."
-        return 1
+        return 2
     fi
 
     while IFS= read -r line; do
@@ -558,8 +571,7 @@ get_target_sink_index () {
         fi
     done <<< "$sink_list"
 
-    msg "Target sink not found. Use 'c' to adjust sink_app_name if needed."
-    return 1
+    return 3
 }
 
 ensure_target_routed () {
@@ -574,7 +586,6 @@ ensure_target_routed () {
 create_null_audio_output () {
     nullsink_module_id="$(pactl list short modules | grep "module-null-sink" | grep "sink_name=$nulloutput_name" | cut -f1 | head -n 1)"
     if [[ -z "$nullsink_module_id" ]]; then
-        nullsink_module_id="$(pactl load-module module-null-sink sink_name="$nulloutput_name")"
         if ! nullsink_module_id="$(pactl load-module module-null-sink sink_name="$nulloutput_name")"; then
             msg "FATAL: Cannot create null sink '$nulloutput_name'"
             exit 1
@@ -920,6 +931,12 @@ Behavior:
   - Output goes to: output-directory/session-name
   - Session auto-finishes when playback becomes pause/stop.
 
+Recommended playback flow:
+  1) Open your player and play any track once (creates sink)
+  2) Pause playback
+  3) Switch to the first track you want to record
+  4) Start playback (metadata refresh triggers recording)
+
 Options:
   --debug                   Enable debug
   --output <dir>            Output directory
@@ -1074,14 +1091,25 @@ main () {
     prompt_session_name
     check_audio_server
 
-    if ! get_target_sink_index; then
-        exit 1
-    fi
+    get_target_sink_index
+    case $? in
+        0)
+            ;;
+        2)
+            show_blocking_notice_and_exit "No active sink-input found. Open your player, start playback, then run again."
+            ;;
+        3)
+            show_blocking_notice_and_exit "Sink-input exists but no app matched sink_app_name='$sink_app_name'. Open config menu (c) to adjust it."
+            ;;
+        *)
+            show_blocking_notice_and_exit "Could not detect target sink."
+            ;;
+    esac
 
     create_null_audio_output
     move_target_output
     tui_set "state" "monitoring"
-    tui_set "message" "Monitoring app/player MPRIS events..."
+    tui_set "message" "Monitoring MPRIS metadata. If playback shows Unknown, start playback or switch to another track to emit metadata."
 
     trap cleanup EXIT INT TERM
 
