@@ -1,11 +1,11 @@
 Source: loopcatcher
 Section: sound
 Priority: optional
-Maintainer: loopcatcher maintainers <maintainers@example.com>
+Maintainer: Kike Fonseca <filipok@gmail.com>
 Build-Depends: build-essential, debhelper-compat (= 13)
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
-Homepage: https://github.com/jefonseca/loopcatcher
+Homepage: https://kikef.work
 
 Package: loopcatcher
 Architecture: all
