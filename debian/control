@@ -5,7 +5,7 @@ Maintainer: Kike Fonseca <filipok@gmail.com>
 Build-Depends: build-essential, debhelper-compat (= 13)
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
-Homepage: https://kikef.work
+Homepage: https://github.com/jefonseca/loopcatcher
 
 Package: loopcatcher
 Architecture: all

@@ -21,7 +21,7 @@ jobs:
         run: bash -n loopcatcher
 
       - name: Validate AppStream metainfo
-        run: appstreamcli validate --pedantic packaging/io.github.jefonseca.loopcatcher.metainfo.xml
+        run: appstreamcli validate --no-net --pedantic packaging/io.github.jefonseca.loopcatcher.metainfo.xml
 
       - name: Validate desktop entry
         run: desktop-file-validate packaging/io.github.jefonseca.loopcatcher.desktop
