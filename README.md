@@ -1,4 +1,7 @@
 # loopcatcher
+[![CI](https://github.com/jefonseca/loopcatcher/actions/workflows/ci.yml/badge.svg)](https://github.com/jefonseca/loopcatcher/actions/workflows/ci.yml)
+[![Debian package](https://github.com/jefonseca/loopcatcher/actions/workflows/debian-package.yml/badge.svg)](https://github.com/jefonseca/loopcatcher/actions/workflows/debian-package.yml)
+
 Generic Linux audio loopback capture tool for recording app/system playback to AAC or OGG.
 
 ## Highlights
@@ -18,6 +21,21 @@ Current version: `0.1`
 - `oggenc` (`vorbis-tools`)
 
 ## Quick start
+Recommended install path (Debian/Ubuntu): download the `.deb` from GitHub Releases and install it.
+
+1. Open releases: `https://github.com/jefonseca/loopcatcher/releases`
+2. Download latest `loopcatcher_*.deb`
+3. Install:
+```bash
+sudo apt install ./loopcatcher_*.deb
+```
+
+Then run:
+```bash
+loopcatcher
+```
+
+Alternative (run from source):
 ```bash
 chmod +x loopcatcher
 ./loopcatcher
@@ -73,6 +91,8 @@ Validation notes:
 ```bash
 dpkg-buildpackage -us -uc -b
 ```
+
+For most users, prefer the prebuilt package from Releases instead of building locally.
 
 ## Quality checks
 Local checks:
