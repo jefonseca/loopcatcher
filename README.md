@@ -74,5 +74,15 @@ Validation notes:
 dpkg-buildpackage -us -uc -b
 ```
 
+## Quality checks
+Local checks:
+```bash
+bash -n loopcatcher
+shellcheck loopcatcher tests/test.sh
+./tests/test.sh
+```
+
+CI runs on push/PR for syntax, ShellCheck, and tests. Release/tag pipeline also runs preflight checks before building `.deb` artifacts.
+
 ## Disclaimer
 This tool is intended for educational and operational use on audio sources you are legally allowed to capture (for example, royalty-free content, your own meetings, or other permitted recordings). You are responsible for complying with local laws, copyright rules, and third-party Terms of Service. The authors are not responsible for misuse.
