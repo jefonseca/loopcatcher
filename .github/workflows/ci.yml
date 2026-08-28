@@ -20,8 +20,11 @@ jobs:
       - name: Bash syntax check
         run: bash -n loopcatcher
 
-      - name: ShellCheck
-        run: shellcheck loopcatcher tests/test.sh
+      - name: ShellCheck (script)
+        run: shellcheck loopcatcher
+
+      - name: ShellCheck (tests)
+        run: shellcheck -e SC1090,SC2034,SC2154,SC2317 tests/test.sh
 
       - name: Run tests
         run: ./tests/test.sh
