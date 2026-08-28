@@ -46,18 +46,30 @@ You can provide runtime overrides:
 
 Recommended playback flow:
 1. Open your player software and play any track once (this creates the sink-input).
-2. Pause playback.
-3. Switch to the first track you actually want to record.
-4. Start playback (the metadata refresh triggers recording correctly).
+2. Pause, then select the first track you actually want to record.
+3. Launch loopcatcher while playback is still paused.
+4. Press Play — the metadata refresh triggers recording.
+
+Recording starts roughly 100–150 ms after Play and each track goes to its own file.
+Track-to-track handoff is near gapless (the previous file is finalized in the background).
+Capture runs at low latency (`parec --latency-msec=30`) so both ends track playback closely.
 
 ## TUI controls
 - `c` open config menu
 - `r` reload config from disk
-- `q` quit safely (removes the loopback sink before exiting)
+- `q` quit safely (finalizes the current file and removes the loopback sink)
 
-When playback switches to pause/stop, the session ends and the TUI waits with `Press any key to exit`.
-Before stopping, capture is kept alive for ~1s so the buffered audio tail is written to the file
-instead of being truncated (this can leave up to ~1s of trailing silence at the end of the last track).
+The dashboard runs on the terminal's alternate screen (your scrollback is untouched and
+restored on exit) and shows an animated indicator while recording.
+
+Once playback has started, **any** non-`Playing` state (pause or stop) ends the session —
+no half tracks, and this is the state Spotify lands in when a playlist finishes. A pause
+*before* the first Play (during setup) is ignored so it can't abort prematurely.
+When the session ends the TUI waits with `Press any key to exit`.
+
+Before stopping, capture is kept running for `tail_drain_seconds` (default `0.35`, configurable)
+so the buffered audio tail lands in the file instead of being cut. The trade-off is up to that
+much near-silence at the very end of the last track; set it to `0` to disable.
 
 On exit the virtual `nulloutput_name` sink is unloaded, so it never stays active in your audio devices list.
 
@@ -67,13 +79,19 @@ On exit the virtual `nulloutput_name` sink is unloaded, so it never stays active
 
 Main keys:
 - `record_format` (`aac` or `ogg`)
-- `bitrate`
+- `bitrate` (kbps; default `64`)
 - `aac_profile`
-- `filename_scheme` (`normal`, `strict`, `strict-lc-nodir`)
+- `filename_scheme` (`normal`, `strict`, `strict-lc-nodir`) — `normal` keeps Unicode
+  letters (accents, non-Latin scripts) and only strips path-unsafe / FAT/NTFS-reserved
+  characters; `strict*` reduce names to ASCII alphanumerics.
 - `output_directory`
 - `sink_app_name` (app sink name to target; default keeps `spotify`)
 - `nulloutput_name`
+- `tail_drain_seconds` (extra capture time after playback stops; `0` disables)
 - `debug`
+
+Only one artist is used for tagging and the folder tree (multi-artist tracks would
+otherwise explode into a huge folder/file structure).
 
 ## CLI options
 ```text
