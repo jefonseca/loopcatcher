@@ -31,9 +31,7 @@ dbus_monitor_pid=""
 record_error_log=""
 show_help=false
 show_version=false
-pending_track_change=true
 exit_on_any_key=false
-exit_reason=""
 no_intro=false
 
 sink_app_name="spotify"
@@ -396,8 +394,12 @@ prompt_session_name () {
         printf '   - Files are saved under: output_directory/session_name\n'
         printf '   - Tip: use date-purpose, e.g. 2026-08-27-album\n\n'
         printf ' Reminder:\n'
-        printf '   Disable Autoplay in your player software so session ends when\n'
-        printf '   playlist/album playback finishes.\n\n'
+        printf '   Disable these playback options in your player software:\n'
+        printf '   - Autoplay\n'
+        printf '   - Crossfade Songs\n'
+        printf '   - Gapless\n'
+        printf '   All three should be disabled so the session can end cleanly\n'
+        printf '   when playlist/album playback finishes.\n\n'
         printf '============================================================\n'
         if [[ -n "$validation_error" ]]; then
             printf ' Warning: %s\n' "$validation_error"
@@ -556,7 +558,7 @@ create_null_audio_output () {
     nullsink_module_id="$(pactl list short modules | grep "module-null-sink" | grep "sink_name=$nulloutput_name" | cut -f1 | head -n 1)"
     if [[ -z "$nullsink_module_id" ]]; then
         nullsink_module_id="$(pactl load-module module-null-sink sink_name="$nulloutput_name")"
-        if [[ $? -ne 0 ]]; then
+        if ! nullsink_module_id="$(pactl load-module module-null-sink sink_name="$nulloutput_name")"; then
             msg "FATAL: Cannot create null sink '$nulloutput_name'"
             exit 1
         fi
@@ -565,8 +567,7 @@ create_null_audio_output () {
 }
 
 move_target_output () {
-    pactl move-sink-input "$source_sink_index" "$nulloutput_name"
-    if [[ $? -ne 0 ]]; then
+    if ! pactl move-sink-input "$source_sink_index" "$nulloutput_name"; then
         msg "FATAL: Cannot move target sink to '$nulloutput_name'"
         exit 1
     fi
@@ -801,7 +802,6 @@ maybe_start_recording () {
 
     if start_recording "$artist" "$album" "$title" "$albumartist" "$tracknumber" "$discnumber"; then
         active_recording_signature="$signature"
-        pending_track_change=false
     fi
 }
 
@@ -823,7 +823,6 @@ process_dbus_line () {
             trackid="${dbus_read#trackid -> }"
             if [[ "$trackid" != "$last_trackid" ]]; then
                 last_trackid="$trackid"
-                pending_track_change=true
                 active_recording_signature=""
                 title=""
                 artist=""

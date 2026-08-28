@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 
+# shellcheck shell=bash
+
 set -u
 
 ROOT_DIR="$(dirname "$(dirname "$(readlink -f "$0")")")"
 SCRIPT_PATH="$ROOT_DIR/loopcatcher"
+
+# shellcheck disable=SC1090
 
 pass_count=0
 fail_count=0
@@ -61,11 +65,13 @@ test_file_path_structure_and_uniqueness () {
     local tmpdir
     tmpdir="$(mktemp -d)"
 
+    # shellcheck disable=SC2034
     out1="$({ source "$SCRIPT_PATH"; session_output_directory="$tmpdir"; filename_scheme="normal"; file_path_structure "Artist" "Album" "Song" "m4a"; })"
     [[ "$out1" == *"Artist/Album/Song.m4a" ]] || return 1
 
     touch "$out1"
 
+    # shellcheck disable=SC2034
     out2="$({ source "$SCRIPT_PATH"; session_output_directory="$tmpdir"; filename_scheme="normal"; file_path_structure "Artist" "Album" "Song" "m4a"; })"
     [[ "$out2" == *"Artist/Album/Song_2.m4a" ]] || return 1
 
@@ -74,9 +80,12 @@ test_file_path_structure_and_uniqueness () {
 
 test_pause_stops_session () {
     local out
+    # shellcheck disable=SC2034
     out="$({
         source "$SCRIPT_PATH"
+        # shellcheck disable=SC2317
         tui_render () { :; }
+        # shellcheck disable=SC2317
         stop_current_recording () { :; }
         playbackstatus="Playing"
         process_dbus_line "playbackstatus -> Paused"
@@ -88,9 +97,12 @@ test_pause_stops_session () {
 
 test_track_change_resets_metadata () {
     local out
+    # shellcheck disable=SC2034
     out="$({
         source "$SCRIPT_PATH"
+        # shellcheck disable=SC2317
         tui_render () { :; }
+        # shellcheck disable=SC2317
         stop_current_recording () { :; }
         title="Old Title"
         artist="Old Artist"
@@ -98,10 +110,10 @@ test_track_change_resets_metadata () {
         last_trackid="track-old"
         playbackstatus="Playing"
         process_dbus_line "trackid -> track-new"
-        printf '%s|%s|%s|%s' "$title" "$artist" "$album" "$pending_track_change"
+        printf '%s|%s|%s|%s' "$title" "$artist" "$album" "$active_recording_signature"
     })"
 
-    [[ "$out" == "|||true" ]]
+    [[ "$out" == "|||" ]]
 }
 
 run_test () {
