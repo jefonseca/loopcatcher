@@ -11,8 +11,6 @@ Generic Linux audio loopback capture tool for recording app/system playback to A
 - XDG config support at `~/.config/loopcatcher/config`.
 - Debian packaging metadata and GitHub Actions workflow for release artifacts.
 
-Current version: `0.1.1`
-
 ## Dependencies
 - `pactl` (PulseAudio or PipeWire with pulse compatibility)
 - `dbus-monitor`
