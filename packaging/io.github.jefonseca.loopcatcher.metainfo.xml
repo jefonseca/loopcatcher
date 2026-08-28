@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>io.github.jefonseca.loopcatcher</id>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Loopcatcher</name>
+  <summary>Capture Linux loopback audio to AAC or OGG files</summary>
+
+  <developer id="io.github.jefonseca">
+    <name>Kike Fonseca</name>
+  </developer>
+
+  <description>
+    <p>
+      Loopcatcher is a Linux TUI tool for capturing loopback audio from
+      PulseAudio/PipeWire sinks into organized, auto-tagged audio files.
+    </p>
+    <p>
+      It routes an application sink input into a monitor sink and encodes the
+      loopback audio into AAC or OGG while preserving track metadata when it is
+      available. It provides interactive TUI controls and stores its runtime
+      configuration under <code>~/.config/loopcatcher</code>.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.jefonseca.loopcatcher.desktop</launchable>
+  <provides>
+    <binary>loopcatcher</binary>
+  </provides>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Recorder</category>
+  </categories>
+
+  <keywords>
+    <keyword>audio</keyword>
+    <keyword>loopback</keyword>
+    <keyword>record</keyword>
+    <keyword>pipewire</keyword>
+    <keyword>pulseaudio</keyword>
+  </keywords>
+
+  <url type="homepage">https://github.com/jefonseca/loopcatcher</url>
+  <url type="bugtracker">https://github.com/jefonseca/loopcatcher/issues</url>
+  <url type="vcs-browser">https://github.com/jefonseca/loopcatcher</url>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.1.4" date="2026-08-27">
+      <description>
+        <p>First release as loopcatcher: generic loopback capture, interactive
+        TUI with runtime config menu, session output handling, and Debian
+        packaging with desktop integration.</p>
+      </description>
+    </release>
+  </releases>
+</component>

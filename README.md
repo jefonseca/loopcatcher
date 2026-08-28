@@ -21,12 +21,15 @@ Generic Linux audio loopback capture tool for recording app/system playback to A
 ## Quick start
 Recommended install path (Debian/Ubuntu): download the `.deb` from GitHub Releases and install it.
 
-1. Open releases: `https://github.com/jefonseca/loopcatcher/releases`
+1. Open [Releases](https://github.com/jefonseca/loopcatcher/releases)
 2. Download latest `loopcatcher_*.deb`
-3. Install:
-```bash
-sudo apt install ./loopcatcher_*.deb
-```
+3. Install it one of two ways:
+   - **Graphical (Debian):** double-click the downloaded `.deb`. It opens in your
+     OS software store (GNOME Software or Plasma Discover) — click **Install**.
+   - **Terminal:**
+     ```bash
+     sudo apt install ./loopcatcher_*.deb
+     ```
 
 Then run:
 ```bash
@@ -132,3 +135,6 @@ CI runs on push/PR for syntax, ShellCheck, and tests. Release/tag pipeline also 
 
 ## Disclaimer
 This tool is intended for educational and operational use on audio sources you are legally allowed to capture (for example, royalty-free content, your own meetings, or other permitted recordings). You are responsible for complying with local laws, copyright rules, and third-party Terms of Service. The authors are not responsible for misuse.
+
+## License
+Released under the MIT License. See [`LICENSE`](LICENSE) for the full text.

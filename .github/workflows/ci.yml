@@ -15,10 +15,16 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y shellcheck appstream desktop-file-utils
 
       - name: Bash syntax check
         run: bash -n loopcatcher
+
+      - name: Validate AppStream metainfo
+        run: appstreamcli validate --pedantic packaging/io.github.jefonseca.loopcatcher.metainfo.xml
+
+      - name: Validate desktop entry
+        run: desktop-file-validate packaging/io.github.jefonseca.loopcatcher.desktop
 
       - name: ShellCheck (script)
         run: shellcheck loopcatcher
