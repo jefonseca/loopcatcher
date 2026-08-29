@@ -1,3 +1,52 @@
+loopcatcher (0.2.0-1) unstable; urgency=medium
+
+  * Replace the hand-rolled ANSI TUI with charmbracelet/gum widgets (fixed
+    width 100, rounded borders, terminal-default colours, margin/padding).
+  * Onboarding is now a one-time gum wizard, shown only when the config file is
+    absent (player profile, codec, bitrate, filename scheme, output directory);
+    it ends with a single "Continue" choice and saves by default.
+  * The session name prompt suggests a timestamped name ("<date>-<time>-
+    loopcatcher"); just press Enter. Session setup is entered directly.
+  * New guided "no sink" wizard replaces the blocking notice: it polls for the
+    player sink, walks the play/pause setup, then confirms.
+  * Config menu is grouped: Codecs, Paths, Player, Advanced.
+  * player_profile_label prints "Custom Player" for the custom profile.
+  * Status view: no more spinner (it caused constant flicker while recording);
+    the view is redrawn only on real changes. Dropped the left/right split -
+    now three stacked boxes below the title: session info (Session Name /
+    Audio Sink / Config File / Output Folder), the metadata table (Artist /
+    Album / Track / Output File, path relative to the session folder), and the
+    status box (Catcher Status / Playback Status + the menu hint).
+  * The no-sink flow is now a three-step "Recording Wizard" with a shared title
+    bar and a bold, centred "Step N" heading over left-aligned instructions:
+    Step 1 "Create the Audio Sink", Step 2 "Prepare to record" (waits for the
+    pause; no more "Ready?" confirm prompt), Step 3 "Start recording" (the
+    pre-first-play status screen). q cancels and exits on every step.
+  * Session name prompt: the suggested timestamp name is now the placeholder, so
+    pressing Enter on an empty field accepts it; a rejected entry is kept in the
+    field for editing instead of being lost. Reject "." and ".." (and, as before,
+    names containing "/") in both the prompt and --session.
+  * Hardening pass: atomic config writes (mktemp + mv), exact-match null-sink
+    detection (an awk token match, no more substring greps), mkdir failure is
+    fatal with a clear message, "mkdir -p --" everywhere, the main loop snapshots
+    the dbus coproc fd so "set -u" cannot abort when the monitor exits, and the
+    dependency check lists the text tools it actually uses.
+  * On session end, a tooltip screen announces the finish and the session path
+    and waits for a keypress before exiting (was an immediate exit).
+  * Open the menu with the "m" key (was any key); the menu is a gum filter
+    (type to narrow). Config-menu items use human-readable labels and no
+    longer show the config file path.
+  * Code review / cleanup: single `ui_screen` helper for every gum screen
+    (clear + bold title + gap); onboarding steps each get their own screen;
+    editing a Player detection field in the config menu now flips the profile
+    to "custom" so the change is not reverted on reload; suppress WINCH while a
+    menu/pager is open so a resize can't paint the status view over it; fold
+    the gum dependency check into check_dependencies with an install hint.
+  * The session-name prompt can be cancelled with Esc (exits cleanly).
+  * Add gum to Depends.
+
+ -- Kike Fonseca <filipok@gmail.com>  Sat, 29 Aug 2026 12:00:00 +0000
+
 loopcatcher (0.1.5-1) unstable; urgency=medium
 
   * First release as loopcatcher.

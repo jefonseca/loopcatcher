@@ -51,6 +51,20 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.2.0" date="2026-08-28">
+      <description>
+        <p>Rebuilt the TUI on charmbracelet/gum. Adds player profiles with
+        player-scoped MPRIS monitoring, a first-run-only onboarding wizard, a
+        guided no-sink setup wizard, automatic session end, and in-app
+        about/license viewers.</p>
+      </description>
+    </release>
+    <release version="0.1.5" date="2026-08-28">
+      <description>
+        <p>Relicense the project under the MIT License and ship AppStream
+        MetaInfo and desktop integration.</p>
+      </description>
+    </release>
     <release version="0.1.4" date="2026-08-27">
       <description>
         <p>First release as loopcatcher: generic loopback capture, interactive

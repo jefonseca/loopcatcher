@@ -12,6 +12,7 @@ Architecture: all
 Depends:
  bash,
  dbus,
+ gum,
  pulseaudio-utils,
  vorbis-tools,
  fdkaac
