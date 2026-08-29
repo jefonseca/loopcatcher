@@ -6,13 +6,16 @@ Generic Linux audio loopback capture tool for recording app/system playback to A
 
 ## Highlights
 - Focused on loopback technology (PulseAudio/PipeWire monitor sink capture), not any specific platform.
-- Interactive TUI for session setup, live status, and runtime config edits.
+- [`gum`](https://github.com/charmbracelet/gum)-based TUI: one-time onboarding wizard, guided no-sink setup, live status view, runtime config menu.
+- Player profiles scope the MPRIS monitor to the selected player, so other media players never trigger a recording.
 - Per-session output folders (`output_directory/session_name`) to avoid accidental overwrite.
 - XDG config support at `~/.config/loopcatcher/config`.
 
 ## Dependencies
+- `gum` (`charmbracelet/gum`) — in Debian 13 `main` (`sudo apt install gum`); on older
+  distros add the [Charm apt repo](https://github.com/charmbracelet/gum#installation)
 - `pactl` (PulseAudio or PipeWire with pulse compatibility)
-- `dbus-monitor`
+- `dbus-monitor` and `dbus-send`
 - `parec`
 - `fdkaac`
 - `oggenc` (`vorbis-tools`)
@@ -46,28 +49,46 @@ You can provide runtime overrides:
 ./loopcatcher --output /path/to/output --session my-session
 ```
 
+First run only: a one-time `gum` onboarding wizard asks for the player profile, codec,
+bitrate, filename scheme and output directory, then writes
+`~/.config/loopcatcher/config`. It never reappears once that file exists (delete it to
+run the wizard again).
+
+Then it goes straight to session setup. The **session name** prompt suggests a
+timestamped name (`<date>-<time>-loopcatcher`) as its placeholder, so you can just press
+Enter to accept it. Pass `--session <name>` to skip the prompt entirely.
+
 Recommended playback flow:
 1. Open your player software and play any track once (this creates the sink-input).
 2. Pause, then select the first track you actually want to record.
 3. Launch loopcatcher while playback is still paused.
 4. Press Play — the metadata refresh triggers recording.
 
+If loopcatcher can't find the player sink at launch it drops into a guided wizard that
+polls for it and walks you through the play/pause setup before continuing.
+
 Recording starts roughly 100–150 ms after Play and each track goes to its own file.
 Track-to-track handoff is near gapless (the previous file is finalized in the background).
 Capture runs at low latency (`parec --latency-msec=30`) so both ends track playback closely.
 
-## TUI controls
-- `c` open config menu
-- `r` reload config from disk
-- `q` quit safely (finalizes the current file and removes the loopback sink)
+## The menu
+In the live status view, press **`m`** to open a `gum` filter menu (type to narrow the
+list):
+- **Resume** — back to the status view
+- **Config** — the configuration menu (grouped: Codecs, Paths, Player, Advanced)
+- **Reload config** — re-read the config file from disk
+- **About** — installed-package metadata, or a run-from-source fallback
+- **License**
+- **Quit** — finalizes the current file and removes the loopback sink
 
-The dashboard runs on the terminal's alternate screen (your scrollback is untouched and
-restored on exit) and shows an animated indicator while recording.
+The live status view runs on the terminal's alternate screen (your scrollback is
+untouched and restored on exit) and shows an animated indicator while recording.
 
 Once playback has started, **any** non-`Playing` state (pause or stop) ends the session —
 no half tracks, and this is the state Spotify lands in when a playlist finishes. A pause
 *before* the first Play (during setup) is ignored so it can't abort prematurely.
-When the session ends the TUI waits with `Press any key to exit`.
+When the session ends, loopcatcher prints *Recording finished, exiting...* and exits
+automatically (the last file path stays in your scrollback).
 
 Before stopping, capture is kept running for `tail_drain_seconds` (default `0.35`, configurable)
 so the buffered audio tail lands in the file instead of being cut. The trade-off is up to that
@@ -80,14 +101,22 @@ On exit the virtual `nulloutput_name` sink is unloaded, so it never stays active
 - Override config path with `--config /path/to/config`
 
 Main keys:
+- `player_profile` — `spotify` or `custom`.
+  - `spotify` fills the three detection fields below with Spotify's values.
+  - `custom` lets you edit them by hand (they are prefilled with the current values).
+  All four are persisted to the config file.
+- `sink_app_name` — app name to match in the audio sink-input.
+- `player_mpris_bus` — MPRIS bus name; scopes the D-Bus monitor to that player
+  (`org.mpris.MediaPlayer2.<player>`), so other MPRIS players never trigger a recording.
+- `player_sink_match` — space-separated globs matched (case-insensitively) against the
+  sink-input `application.name`.
 - `record_format` (`aac` or `ogg`)
 - `bitrate` (kbps; default `48`)
-- `aac_profile`
+- `aac_profile` — applies to `aac` only.
 - `filename_scheme` (`normal`, `strict`, `strict-lc-nodir`) — `normal` keeps Unicode
   letters (accents, non-Latin scripts) and only strips path-unsafe / FAT/NTFS-reserved
   characters; `strict*` reduce names to ASCII alphanumerics.
 - `output_directory`
-- `sink_app_name` (app sink name to target; default keeps `spotify`)
 - `nulloutput_name`
 - `tail_drain_seconds` (extra capture time after playback stops; `0` disables)
 - `debug`
@@ -111,7 +140,7 @@ otherwise explode into a huge folder/file structure).
 --bitrate <kbps>          Bitrate target
 --scheme <scheme>         Filename scheme
 --config <path>           Config path override
---no-intro                Skip startup intro screen
+--no-intro                Skip the first-run onboarding wizard (writes defaults)
 ```
 
 Validation notes:
