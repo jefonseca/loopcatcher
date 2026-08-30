@@ -2,10 +2,9 @@
 ###############################################################################
 # loopcatcher - record app/system loopback audio to AAC or OGG files.
 #
-# Flow: onboarding (first run only) -> session name -> sink detection / wizard
-#       -> live status view (metadata + recording). Press "m" in the status view
-#       to open the gum menu (Resume / Config / Reload / About / License / Quit).
-#       The session ends automatically when playback stops.
+# Flow: Welcome (configuration) -> Session Name -> Recording Wizard (3 steps)
+#       -> Recording screen -> Finish. The session ends automatically when
+#       playback pauses, stops, or the player quits.
 ###############################################################################
 
 set -u
@@ -20,24 +19,70 @@ fi
 # Constants
 ###############################################################################
 
-# gum styling rules for the whole UI: no explicit colours (terminal defaults),
-# fixed --width 100, --border rounded (never double).
+# gum styling rules for the whole UI: fixed total rendered width 100
+# (UI_WIDTH), everywhere. "gum style --width N" sets N as CONTENT width and
+# adds its own border on top (+2 total, verified for every border style this
+# app uses: normal/rounded/thick/double all add exactly 1 column per side) -
+# every constant below already subtracts that border (and, where present,
+# margin) so the box/table/row's ACTUAL rendered footprint is exactly
+# UI_WIDTH. Never pass UI_WIDTH straight to --width on a bordered element.
 UI_WIDTH=100
 
+# Cursor/prompt marker used on every interactive gum widget in the app: the
+# --cursor on every "gum choose" (the only selection widget used anywhere -
+# "gum filter" looks visually different and is never used, even for long
+# lists) and the --prompt on every "gum input".
+UI_CURSOR="👉 "
+
+# Content width for a single-border element meant to span the full TUI width
+# (border adds 2) - used by ui_box, and by ui_title() when shown alone
+# (border 2, no margin: UI_WIDTH - 2).
+UI_BOX_CONTENT_WIDTH=$((UI_WIDTH - 2))
+# Usable text width inside a Normal element, e.g. ui_subtitle nested in a
+# Wizard step (ui_box's own border 2 already removed above; its padding
+# "1 10" removes 20 more).
+UI_INNER_WIDTH=$((UI_BOX_CONTENT_WIDTH - 20))
+
+# Column widths for every "Field / Value" gum table (ui_kv_table). gum table's
+# own --widths flag has no effect in --print (static) mode - confirmed by
+# testing, it only matters for the interactive/live table - so ui_kv_table
+# pads every field to a fixed width itself before gum ever sees it. Measured
+# empirically: a 2-column "gum table --border rounded" then renders at exactly
+# label + value + 7 columns wide (borders + separator + each cell's own
+# leading/trailing space), so this makes the whole table exactly UI_WIDTH.
+UI_TABLE_LABEL_WIDTH=18
+UI_TABLE_VALUE_WIDTH=$((UI_WIDTH - UI_TABLE_LABEL_WIDTH - 7))
+
+# The Cancel hint sits to the right of the Title Bar (see ui_title_row), each
+# in its own bordered box (+2 each, so -4 total). Its column is a fixed
+# content width; the Title Bar box takes what's left, so the joined row is
+# exactly UI_WIDTH wide.
+UI_HINT_WIDTH=36
+UI_TITLE_ROW_WIDTH=$((UI_WIDTH - 4 - UI_HINT_WIDTH))
+
+# Notification content width: same as a Normal element (border 2, no
+# horizontal margin) so it lines up with every other element's total width.
+UI_NOTIFY_WIDTH=$UI_BOX_CONTENT_WIDTH
+
 # Keep gum styling (bold, borders) when its stdout is a pipe - the nested
-# $(gum style ...) fragments composed inside status_render need this.
+# $(gum style ...) fragments composed for a screen frame need this.
 export CLICOLOR_FORCE=1
 
 # Built-in "spotify" player profile.
 readonly SPOTIFY_MPRIS_BUS="org.mpris.MediaPlayer2.spotify"
 readonly SPOTIFY_SINK_MATCH="spotify spotify* com.spotify.client com.spotify.client* com.spotify.Client*"
 
+# Shown on the Welcome screen the first time (no config file yet). Kept in a
+# variable so it is easy to customise.
+readonly WELCOME_MESSAGE="Welcome to LoopCatcher. It captures loopback audio from your desktop media player into organized, auto-tagged audio files, ready to use with the default configuration below."
+
 ###############################################################################
 # Global state
 ###############################################################################
 
 # --- persisted to the config file ---
-debug=false
+# 0 = no log written at all, 1 = normal session log, 2 = adds encoder diagnostics.
+log_level="0"
 player_profile="spotify"
 sink_app_name="spotify"
 player_mpris_bus="$SPOTIFY_MPRIS_BUS"
@@ -53,30 +98,32 @@ output_directory=""
 # written instead of cut. Trade-off: up to this much near-silence at the end of
 # the last track. 0 disables it.
 tail_drain_seconds="0.35"
+# Directory the session log is written to (see init_session_log). Empty means
+# the default: "${TMPDIR:-/tmp}/loopcatcher".
+log_directory=""
 
 # --- CLI / lifecycle ---
 show_help=false
 show_version=false
-no_intro=false
 should_exit=0
 exit_note=""
 
 # --- live status view ---
-status_active=false
-status_dirty=0            # main_loop repaints once per tick only when this is set
-_status_last_frame=""     # last painted frame; identical repaints are skipped
-STATUS_TITLE=""           # precomputed once (see status_chrome_init)
-STATUS_INFO=""            # precomputed once (session/sink/config/output box)
-tui_state="starting"
-tui_last_message=""
+status_dirty=0             # main loop repaints once per tick only when this is set
+_spinner_pid=""             # backgrounded "gum spin" decorating the Recording screen
+recording_failed=false     # Catcher Status: false -> "Recording", true -> "Failed"
+session_ended=false        # set by end_session(); tells main() to show the Finish screen
 tui_track="-"
 tui_artist="-"
 tui_album="-"
+tui_tracknumber="-"
+tui_discnumber="-"
 tui_output="-"
 
 # --- session ---
 session_name=""
 session_output_directory=""
+session_log_path=""
 
 # --- sink routing ---
 source_sink_index=""
@@ -87,16 +134,28 @@ encoder_pid=""
 record_fifo_dir=""
 record_error_log=""
 stopping_recording=false
+# Metadata + start time of the in-flight recording, set by start_recording and
+# consumed (then cleared) by stop_current_recording once it actually stops, so
+# the session log gets the real capture duration alongside the metadata.
+record_start_seconds=0
+record_log_artist=""
+record_log_album=""
+record_log_title=""
+record_log_tracknumber=""
+record_log_discnumber=""
+record_log_file=""
 
 # --- MPRIS monitor ---
 dbus_monitor_pid=""
 playbackstatus="Unknown"
 started_playing=false
+player_missing_polls=0    # consecutive liveness polls with the player bus gone
 active_recording_signature=""
 trackid=""
 last_trackid=""
 title=""
-artist=""
+artist=""       # first xesam:artist value - used for naming, log, AAC tag
+artist_all=()   # every xesam:artist value - used for the table and OGG tags
 album=""
 albumartist=""
 tracknumber=""
@@ -131,7 +190,7 @@ check_dependencies () {
         gum tr cut awk grep
         dbus-monitor dbus-send
         pactl parec
-        tput mktemp mkfifo
+        mktemp mkfifo
     )
     for req in "${requirements[@]}"; do
         command -v "$req" >/dev/null 2>&1 && continue
@@ -155,7 +214,43 @@ check_encoder_dependency () {
 }
 
 ###############################################################################
-# gum UI helpers
+# ELEMENT TYPES
+#
+# Every visual element on screen is produced by exactly one of the functions
+# below (or, for the Spinner, one of the two literal "gum spin" calls noted
+# below). To change how an element type LOOKS, edit only its gum flags here -
+# every screen that uses it picks up the change automatically. Nothing else in
+# the script should call "gum style" directly for a boxed/bordered element.
+#
+#   Title Bar     -> ui_title ()        top banner, alone (Finish screen only)
+#   Title row     -> ui_title_row ()    Title Bar + Cancel hint joined side by
+#                                        side via "gum join" - every other
+#                                        screen starts with this instead
+#   Normal        -> ui_box ()          standard content panel
+#   Notification  -> ui_notify ()       validation-error panel, Finish screen
+#   Cancel hint   -> ui_cancel_hint ()  bold text, never inside a bordered box
+#                                        (it sits beside the Title Bar, not in
+#                                        it - see ui_title_row)
+#   Spinner       -> real "gum spin" calls in wizard_step_screen() (Recording
+#                    Wizard steps) and recording_screen_render() (Recording
+#                    screen) - the --spinner flag picks the animation there
+#   Table         -> ui_kv_table ()     "Field / Value" rows, a real "gum
+#                                        table" (rounded border) - the
+#                                        standard way this app shows any list
+#                                        of labelled values (info/metadata/
+#                                        status, Welcome's config summary).
+#                                        Always a standalone sibling element,
+#                                        never nested inside a Normal box.
+#   Gap           -> ui_gap ()          one blank line, printed right before
+#                                        every interactive widget ("gum
+#                                        choose"/"gum input"/"gum spin") so it
+#                                        never sits flush against the element
+#                                        above it
+#
+# ui_subtitle (bold, centred heading - nested inside a Normal element, e.g. a
+# Wizard step, or standalone above a Table, e.g. Welcome) and the shared table
+# column widths (UI_TABLE_LABEL_WIDTH / UI_TABLE_VALUE_WIDTH, above) live here
+# too.
 ###############################################################################
 
 require_tty () {
@@ -169,208 +264,184 @@ ui_clear () {
     printf '\033[H\033[2J'
 }
 
-# Standard panel: fixed width, rounded border, terminal-default colours.
-ui_box () {
-    gum style --width "$UI_WIDTH" --border rounded --padding "1 4" -- "$@"
-}
-
-# Centre-aligned, bold title panel.
+# Title Bar element: always "LoopCatcher v$SCRIPT_VERSION - <screen name>".
+# $2 (optional) overrides the box's content width - ui_title_row narrows it to
+# make room for the Cancel hint beside it; alone (Finish screen) it is full
+# width.
 ui_title () {
-    gum style --width "$UI_WIDTH" --border rounded --align center --bold --padding "1 1" -- "$@"
+    local width="${2:-$UI_BOX_CONTENT_WIDTH}"
+    gum style --width "$width" --margin "1 0" --padding "1 1" --border normal --align center --bold -- \
+        "LoopCatcher v$SCRIPT_VERSION - $1"
 }
 
-# Every gum screen starts here: clear, draw the page title, add a two-line gap
-# before the following element (choose / box / input).
-ui_screen () {
-    local sub="${1:-}"
-    [[ $# -ge 1 ]] && shift
-    ui_clear
-    ui_title "loopcatcher  -  $sub" "$@"
-    printf '\n\n'
+# "Tipo normal" element.
+ui_box () {
+    gum style --width "$UI_BOX_CONTENT_WIDTH" --margin "0 0" --padding "1 5" --border rounded -- "$@"
 }
 
-# Shorten a value for the status view: keep the tail, prefix with an ellipsis.
-_clip () {
-    local s="$1" max="${2:-86}"
+# Bold, centred subtitle. $2 (optional) overrides its width - defaults to
+# UI_INNER_WIDTH (nested inside a Normal element, e.g. a Wizard step heading);
+# pass UI_WIDTH when it stands on its own above a sibling Table element.
+ui_subtitle () {
+    local width="${2:-$UI_INNER_WIDTH}"
+    gum style --width "$width" --margin "0 0" --padding "0 0" --bold --align center -- "$1"
+}
+
+# Notification element.
+ui_notify () {
+    gum style --width "$UI_NOTIFY_WIDTH" --margin "1 0" --padding "1 5" --border double --align center --foreground="#D5A021" --border-foreground="#D5A021" -- "$@"
+}
+
+# Cancel pseudo-element: bold, right-aligned in its own column, never inside a
+# bordered element. Only ever composed into ui_title_row.
+ui_cancel_hint () {
+    gum style --width "$UI_HINT_WIDTH" --margin "0 0" --padding "1 1" --border thick --bold --align center --foreground="#D5A021" --border-foreground="#D5A021" -- 'Press Ctrl+C to cancel and exit.'
+}
+
+# Gap element: one blank line, printed right before every interactive widget
+# ("gum choose"/"gum input"/"gum spin") so it never sits flush against
+# whatever was printed above it. The blank line itself comes from the empty
+# content, not the margin - margin is "0 0" for now, bump it here later for
+# more space.
+ui_gap () {
+    gum style --margin="0 0" -- ""
+}
+
+# Title Bar + Cancel hint, joined into one row: Title Bar on the left, hint on
+# the right, vertically centred. Used at the top of every screen that shows
+# the Cancel hint (i.e. every screen except Finish, which has no hint and uses
+# ui_title() alone via render_page_plain).
+ui_title_row () {
+    gum join --horizontal --align center -- \
+        "$(ui_title "$1" "$UI_TITLE_ROW_WIDTH")" "$(ui_cancel_hint)"
+}
+
+# Table element: every "Field / Value" list in the app (info/metadata/status,
+# Welcome's config summary) is a standalone, self-bordered "gum table" - a
+# sibling of the other elements on the page, not nested inside a Normal box.
+# gum table's own --widths is a no-op in --print mode, so each field is padded
+# to a fixed width (UI_TABLE_LABEL_WIDTH / UI_TABLE_VALUE_WIDTH) before gum
+# ever sees it - gum then just renders already-fixed-width cells. $1/$2 are
+# the two column headers (the first column's header doubles as the table's
+# title, e.g. "Info"/"Metadata"/"Status" - leave $2 empty for no header on the
+# value column); the rest are label/value pairs:
+# ui_kv_table "<col1>" "<col2>" "L1" "V1" "L2" "V2" ...
+ui_kv_table () {
+    # gum table rejects a --columns list with a genuinely empty trailing
+    # entry ("invalid number of columns" - it drops the empty token instead
+    # of keeping an empty column name), so an empty header is a single space.
+    local col1="$1" col2="${2:- }"; shift 2
+    local rows="" label value padded_label padded_value
+    while [[ $# -ge 2 ]]; do
+        label="$1"; value="${2:--}"
+        printf -v padded_label '%-*s' "$UI_TABLE_LABEL_WIDTH" "$label"
+        printf -v padded_value '%-*s' "$UI_TABLE_VALUE_WIDTH" "$value"
+        rows+="$padded_label"$'\t'"$padded_value"$'\n'
+        shift 2
+    done
+    printf '%s' "$rows" | gum table --print --border rounded \
+        --separator "$(printf '\t')" --columns "$col1,$col2"
+}
+
+# Shorten a long value (paths) so a table row does not wrap.
+clip_text () {
+    local s="$1" max="${2:-65}"
     if (( ${#s} > max )); then
         s="…${s: -$((max - 1))}"
     fi
     printf '%s' "$s"
 }
 
-# "Label" (bold, padded to a column) immediately followed by its value.
-# Raw SGR (not "gum style") so it costs no subprocess - status_render runs this
-# several times per repaint.
-_kv () {
-    local label
-    printf -v label '%-17s' "$1"
-    printf '\033[1m%s\033[0m%s' "$label" "$2"
+# Common tail shared by render_page / render_page_plain: each pre-rendered
+# element, flush against the next one - any spacing between elements comes
+# only from an element's own gum padding/margin, never from this glue.
+_render_elements () {
+    local el
+    for el in "$@"; do
+        [[ -n "$el" ]] && printf '%s\n' "$el"
+    done
 }
 
-# Floating "tooltip" style used for the wait / announce screens.
-ui_tooltip () {
-    gum style --border rounded --width 80 --margin "4 10" --padding "4 4" -- "$@"
+# Every "Tipo normal" screen that shows the Cancel hint: clear, Title Bar +
+# Cancel hint row, then each pre-rendered element. This is the default - use
+# it unless the screen has no Cancel hint to show (only the Finish screen).
+render_page () {
+    local name="$1"; shift
+    ui_clear
+    printf '%s\n' "$(ui_title_row "$name")"
+    _render_elements "$@"
 }
 
-# In-place repaint for the live status view: home, write the already-composed
-# frame, erase whatever the previous (taller) frame left below. No full \033[2J,
-# so there is no blank flash - the old frame stays until the new bytes land.
-# Every status line is full-width, so nothing is left to the right.
+# Same, but with a plain full-width Title Bar and no Cancel hint. Only the
+# Finish screen uses this - it has nothing left to cancel.
+render_page_plain () {
+    local name="$1"; shift
+    ui_clear
+    printf '%s\n' "$(ui_title "$name")"
+    _render_elements "$@"
+}
+
+_cancel_and_exit () {
+    printf 'Cancelled.\n' >&2
+    exit 0
+}
+
+# Alternate screen, used only for the live Recording / Finish screens.
+screen_enter () {
+    [[ -t 1 ]] && printf '\033[?1049h\033[?25l\033[2J\033[H'
+}
+
+screen_leave () {
+    [[ -t 1 ]] && printf '\033[?25h\033[?1049l'
+}
+
+# In-place repaint for the Recording screen: home, write the frame, erase
+# whatever the previous frame left below - avoids a full-clear flash.
 paint_frame () {
     printf '\033[H%s\033[J' "$1"
 }
 
-# One-shot screens (wizard / tooltip): wipe the whole screen and draw the frame
-# in a single write() so the clear and the draw reach the terminal together.
-paint_screen () {
-    printf '\033[2J\033[H%s' "$1"
-}
-
-# Full screen: page title, then a centred tooltip box. Composed first, then
-# painted in one write.
-ui_tooltip_screen () {
-    local sub="${1:-}"
-    [[ $# -ge 1 ]] && shift
-    paint_screen "$(printf '%s\n%s' \
-        "$(ui_title "loopcatcher  -  $sub")" \
-        "$(ui_tooltip "$@")")"
-}
-
-# One Recording Wizard step: the title bar, then a tooltip box holding a bold,
-# centred "Step N" heading followed by left-aligned instruction lines and the
-# cancel hint. $1 = heading; the remaining args = instruction lines.
-wizard_step_screen () {
-    local heading="$1"; shift
-    paint_screen "$(printf '%s\n%s' \
-        "$(ui_title "loopcatcher  -  Recording Wizard")" \
-        "$(ui_tooltip "$(gum join --vertical \
-            "$(gum style --bold --align center --width 70 -- "$heading")" \
-            "$(gum style --width 70 -- "" "$@" "" '(press q to cancel)')")")")"
-}
-
 ###############################################################################
-# Live status view (event-driven; no animation, redrawn only on real changes)
+# Session log / debugging
+#
+# One log per session, written under log_directory (configurable; defaults to
+# the OS temp directory), recording every captured item (the same metadata the
+# Recording screen shows, plus how long the capture took). Governed entirely
+# by log_level: 0 no log is written (not even the file), 1 the log above, 2
+# also adds encoder (fdkaac / oggenc) diagnostics - debugging is intentionally
+# limited to those two tools.
 ###############################################################################
 
-# tui_output made relative to the session folder (Artist/Album/File).
-status_output_relpath () {
-    local f="${tui_output:--}"
-    if [[ "$f" == "-" || -z "$f" ]]; then
-        printf -- '-'
-    elif [[ -n "$session_output_directory" && "$f" == "$session_output_directory/"* ]]; then
-        printf '%s' "${f#"$session_output_directory"/}"
-    else
-        printf '%s' "$f"
-    fi
+# The directory session logs are written to: log_directory if the user set
+# one, else the default. Shared by init_session_log and the Configuration
+# screen (so the Paths group can show the effective value, not just "").
+effective_log_directory () {
+    printf '%s' "${log_directory:-${TMPDIR:-/tmp}/loopcatcher}"
 }
 
-# The title bar and the session-info box never change during a session, so build
-# them once. Call again after the config menu (output_directory may have moved).
-status_chrome_init () {
-    STATUS_TITLE="$(ui_title "loopcatcher  -  v$SCRIPT_VERSION")"
-    STATUS_INFO="$(gum style --width "$UI_WIDTH" --border rounded --padding "1 2" -- \
-        "$(_kv 'Session Name:'  "$(_clip "${session_name:--}" 74)")" \
-        "$(_kv 'Audio Sink:'    "${source_sink_index:--}")" \
-        "$(_kv 'Config File:'   "$(_clip "$config_path" 74)")" \
-        "$(_kv 'Output Folder:' "$(_clip "${output_directory:--}" 74)")")"
+init_session_log () {
+    [[ "$log_level" -ge 1 ]] || return 0
+    local dir
+    dir="$(effective_log_directory)"
+    mkdir -p -- "$dir" 2>/dev/null
+    session_log_path="$dir/$session_name.log"
 }
 
-status_render () {
-    [[ "$status_active" == "true" && -t 1 ]] || return
-
-    local frame
-
-    if [[ "$started_playing" != "true" ]]; then
-        # Before the first Playing: the final Recording Wizard step. Composed
-        # here (not via wizard_step_screen) so the identical-frame check applies.
-        frame="$(printf '%s\n%s' \
-            "$(ui_title "loopcatcher  -  Recording Wizard")" \
-            "$(ui_tooltip "$(gum join --vertical \
-                "$(gum style --bold --align center --width 70 -- 'Step 3: Start recording')" \
-                "$(gum style --width 70 -- '' \
-                    '1) Play the first track of your playlist or album to start the recording automatically' \
-                    '' '(press q to cancel)')")")")"
-    else
-        local tab meta status
-        tab="$(printf 'Field\tValue\nArtist\t%s\nAlbum\t%s\nTrack\t%s\nOutput File\t%s\n' \
-            "$(_clip "${tui_artist:--}" 78)" \
-            "$(_clip "${tui_album:--}" 78)" \
-            "$(_clip "${tui_track:--}" 78)" \
-            "$(_clip "$(status_output_relpath)" 78)" \
-            | gum table --print --separator "$(printf '\t')" --border rounded --widths 14,80)"
-        meta="$(gum style --width "$UI_WIDTH" --border rounded --padding "1 2" -- "$tab")"
-        status="$(gum style --width "$UI_WIDTH" --border rounded --padding "1 2" -- \
-            "$(_kv 'Catcher Status:'  "$tui_state")" \
-            "$(_kv 'Playback Status:' "$playbackstatus")" \
-            "" \
-            "$(printf '\033[1mPress "m" key to open the menu\033[0m')")"
-        printf -v frame '%s\n%s\n%s\n%s' "$STATUS_TITLE" "$STATUS_INFO" "$meta" "$status"
-    fi
-
-    # Repainting the same bytes in place is invisible; skip the write entirely.
-    [[ "$frame" == "$_status_last_frame" ]] && return
-    _status_last_frame="$frame"
-    paint_frame "$frame"
+log_line () {
+    [[ "$log_level" -ge 1 && -n "$session_log_path" ]] || return 0
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$session_log_path" 2>/dev/null
 }
 
-screen_enter () {
-    [[ "$status_active" == "true" && -t 1 ]] || return
-    # Switch to the alternate screen, hide the cursor, start from a clean buffer
-    # so the first in-place paint_frame has nothing stale under it.
-    printf '\033[?1049h\033[?25l\033[2J\033[H'
+# $1 artist $2 album $3 title $4 track number $5 disc number $6 output file
+# $7 capture duration in seconds - the fields the Recording screen's
+# Metadata table shows, plus duration.
+log_recording () {
+    log_line "captured artist=\"$1\" album=\"$2\" title=\"$3\" track=\"$4\" disc=\"$5\" file=\"$6\" duration_seconds=\"$7\""
 }
 
-screen_leave () {
-    [[ "$status_active" == "true" && -t 1 ]] || return
-    printf '\033[?25h\033[?1049l'
-}
-
-###############################################################################
-# UI state mutators
-###############################################################################
-
-msg () {
-    if [[ "${2:-}" == "debug" ]]; then
-        if [[ "$debug" == "true" || "$debug" == "yes" ]]; then
-            printf 'DEBUG: %s\n' "$1" >&2
-        fi
-        return
-    fi
-    tui_last_message="$1"
-    status_dirty=1
-    return 0
-}
-
-# Setters only flag the view dirty; main_loop coalesces a burst of these into a
-# single repaint per tick (a metadata burst is 5+ setters).
-tui_set () {
-    case "$1" in
-        state)   tui_state="$2" ;;
-        track)   tui_track="$2" ;;
-        artist)  tui_artist="$2" ;;
-        album)   tui_album="$2" ;;
-        output)  tui_output="$2" ;;
-        message) tui_last_message="$2" ;;
-    esac
-    status_dirty=1
-    return 0
-}
-
-finish_session_and_exit () {
-    tui_state="session-ended"
-    tui_last_message="$1"
-    if [[ "$status_active" == "true" && -t 1 ]]; then
-        ui_tooltip_screen "v$SCRIPT_VERSION" \
-            "$1" \
-            "" \
-            "Your recordings are in:" \
-            "${session_output_directory:-$output_directory}" \
-            "" \
-            "Press any key to exit."
-        read -rsn1
-    fi
-    should_exit=1
-    return 0
+log_debug () {
+    [[ "$log_level" -ge 2 ]] || return 0
+    log_line "DEBUG: $1"
 }
 
 ###############################################################################
@@ -389,10 +460,6 @@ load_config () {
         # shellcheck disable=SC1090
         source "$config_path"
     fi
-
-    # Legacy key aliases (never written back).
-    [[ -n "${recordformat:-}" ]]   && record_format="$recordformat"
-    [[ -n "${filenamescheme:-}" ]] && filename_scheme="$filenamescheme"
 
     case "${player_profile:-}" in
         custom)
@@ -415,8 +482,8 @@ save_config () {
         return 1
     }
     cat > "$tmp" <<EOF
-# loopcatcher config - edited at runtime via the status-view menu (press "m").
-debug="$debug"
+# loopcatcher config - edited at runtime via the Configuration screen.
+log_level="$log_level"
 player_profile="$player_profile"
 sink_app_name="$sink_app_name"
 player_mpris_bus="$player_mpris_bus"
@@ -428,23 +495,15 @@ record_format="$record_format"
 filename_scheme="$filename_scheme"
 output_directory="$output_directory"
 tail_drain_seconds="$tail_drain_seconds"
+log_directory="$log_directory"
 EOF
     # Atomic replace: a crash mid-write never leaves a truncated config.
     mv -f -- "$tmp" "$config_path" || { rm -f -- "$tmp"; return 1; }
 }
 
-reload_config () {
-    load_config
-    if validate_settings_soft; then
-        tui_set "message" "Config reloaded from $config_path"
-    else
-        tui_set "message" "Config reloaded with warnings (check values)"
-    fi
-}
-
 # Prints the first problem it finds and returns 1; returns 0 when all valid.
 # validate_settings is the hard (exit 1) startup wrapper; validate_settings_soft
-# is used from the live config menu / reload so a bad value cannot kill a run.
+# is used from the Configuration screen so a bad value cannot kill a run.
 _validate_settings () {
     case "$record_format" in
         aac|ogg) ;;
@@ -473,9 +532,9 @@ _validate_settings () {
     if [[ ! "$tail_drain_seconds" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         printf 'Invalid tail_drain_seconds: %s (must be a non-negative number, e.g. 0.35)\n' "$tail_drain_seconds"; return 1
     fi
-    case "$debug" in
-        true|false|yes|no) ;;
-        *) printf 'Invalid debug: %s (allowed: true, false, yes, no)\n' "$debug"; return 1 ;;
+    case "$log_level" in
+        0|1|2) ;;
+        *) printf 'Invalid log_level: %s (allowed: 0, 1, 2)\n' "$log_level"; return 1 ;;
     esac
     return 0
 }
@@ -527,6 +586,42 @@ player_playback_status () {
       | awk -F'"' '/string "(Playing|Paused|Stopped)"/{print $2; exit}'
 }
 
+_playback_is_playing () {
+    [[ "$(player_playback_status)" == "Playing" ]]
+}
+
+_playback_is_stopped () {
+    [[ "$(player_playback_status)" != "Playing" ]]
+}
+
+# True while the player's MPRIS name still has an owner on the bus. Closing the
+# player releases the name but emits no PropertiesChanged, so poll_player_liveness
+# checks this to end a session whose player quit outright. An empty bus name (a
+# half-configured custom profile) counts as alive so we never self-terminate.
+player_bus_has_owner () {
+    [[ -n "$player_mpris_bus" ]] || return 0
+    dbus-send --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.GetNameOwner "string:$player_mpris_bus" >/dev/null 2>&1
+}
+
+# Called by the main loop on a timer once playback has begun. A plain quit of
+# the player sends no Paused/Stopped signal and dbus-monitor keeps running,
+# which would leave us recording silence forever; two consecutive misses
+# (~a few seconds) end the session the same way a pause does.
+poll_player_liveness () {
+    [[ "$started_playing" == "true" && $should_exit -eq 0 ]] || return 0
+    if player_bus_has_owner; then
+        player_missing_polls=0
+        return 0
+    fi
+    player_missing_polls=$((player_missing_polls + 1))
+    [[ $player_missing_polls -ge 2 ]] || return 0
+    stop_current_recording "drain"
+    active_recording_signature=""
+    log_line "player exited"
+    end_session
+}
+
 ###############################################################################
 # Output directory / session name
 ###############################################################################
@@ -554,9 +649,7 @@ default_music_dir () {
 }
 
 initialize_output_directory () {
-    local defaulted=0
-    [[ -n "$output_directory" ]] || { output_directory="$(default_music_dir)"; defaulted=1; }
-
+    [[ -n "$output_directory" ]] || output_directory="$(default_music_dir)"
     if [[ -z "$output_directory" ]]; then
         printf 'FATAL: could not determine an output directory (HOME is unset).\n' >&2
         exit 1
@@ -565,10 +658,6 @@ initialize_output_directory () {
         printf 'FATAL: cannot create output directory: %s\n' "$output_directory" >&2
         exit 1
     fi
-
-    # Persist the auto-picked default so it stays put on the next run.
-    [[ $defaulted -eq 1 ]] && save_config
-    return 0
 }
 
 default_session_name () {
@@ -596,8 +685,65 @@ dir_not_empty () {
     return 1
 }
 
-# Resolve session_name + session_output_directory, then create the folder.
-session_name_step () {
+###############################################################################
+# Welcome screen
+###############################################################################
+
+welcome_screen () {
+    local choice outdir
+
+    while true; do
+        if [[ ! -f "$config_path" ]]; then
+            outdir="${output_directory:-$(default_music_dir)}"
+            render_page "Welcome" \
+                "$(ui_box "$WELCOME_MESSAGE")" \
+                "$(ui_subtitle 'Default Configuration' "$UI_WIDTH")" \
+                "$(ui_kv_table 'Field' 'Value' \
+                    'Codec' "$record_format" \
+                    'AAC Profile' "$aac_profile" \
+                    'Bitrate' "${bitrate} kbps" \
+                    'Player Profile' "$(player_profile_label "$player_profile")" \
+                    'Output Directory' "$(clip_text "$outdir")")"
+            ui_gap
+            choice="$(gum choose --header "Do you want to accept the default configuration?" \
+                --cursor="$UI_CURSOR" --selected "Accept configuration" -- "Accept configuration" "Change configuration")" \
+                || _cancel_and_exit
+            case "$choice" in
+                "Accept configuration")
+                    output_directory="$outdir"
+                    save_config
+                    load_config
+                    return
+                    ;;
+                "Change configuration") config_screen ;;
+            esac
+        else
+            load_config
+            render_page "Welcome" \
+                "$(ui_subtitle 'Saved Configuration' "$UI_WIDTH")" \
+                "$(ui_kv_table 'Field' 'Value' \
+                    'Codec' "$record_format" \
+                    'AAC Profile' "$aac_profile" \
+                    'Bitrate' "${bitrate} kbps" \
+                    'Player Profile' "$(player_profile_label "$player_profile")" \
+                    'Output Directory' "$(clip_text "${output_directory:-$(default_music_dir)}")")"
+            ui_gap
+            choice="$(gum choose --header "Continue with this configuration?" \
+                --cursor="$UI_CURSOR" --selected "Continue" -- "Continue" "Change configuration")" \
+                || _cancel_and_exit
+            case "$choice" in
+                Continue) return ;;
+                "Change configuration") config_screen ;;
+            esac
+        fi
+    done
+}
+
+###############################################################################
+# Session Name screen
+###############################################################################
+
+session_name_screen () {
     local suggested prefill="" err="" value candidate
 
     # CLI --session fast path: validate, never prompt.
@@ -617,34 +763,20 @@ session_name_step () {
         return
     fi
 
-    require_tty "session setup"
     suggested="$(default_session_name)"
 
     while true; do
-        ui_screen "session"
-        ui_box \
-            "This session:" \
-            "" \
-            "  - captures the app audio through a Linux loopback monitor sink" \
-            "  - saves files under  output_directory/session_name" \
-            "  - stops automatically when playback pauses or stops" \
-            "" \
-            "Recommended flow:" \
-            "  1  Play a track once to create the sink" \
-            "  2  Pause and select the first track to record" \
-            "  3  Leave loopcatcher open while still paused" \
-            "  4  Press Play - recording starts on the metadata refresh" \
-            "" \
-            "Disable Autoplay / Crossfade / Gapless in your player so the session ends cleanly."
-        [[ -n "$err" ]] && ui_box "$err"
+        render_page "Session Name" \
+            "$(ui_box \
+                "This is the session name. It is used to generate the destination folder for what will be recorded, so existing files are not accidentally overwritten." \
+                "" \
+                "$(gum style --bold -- 'Enter a UNIQUE session name that has not been used before.')")"
+        [[ -n "$err" ]] && printf '%s\n' "$(ui_notify "$err")"
+        ui_gap
 
-        # Placeholder = the suggested timestamp name (used when the field is left
-        # empty). prefill = the last rejected entry, so a typo can be corrected
-        # instead of retyped.
-        if ! value="$(gum input --header "Session name  (Enter for the suggested name, Esc to cancel)" \
-                --placeholder "$suggested" --value "$prefill")"; then
-            printf 'Cancelled.\n' >&2
-            exit 0
+        if ! value="$(gum input --header "Session name (Enter for the suggested name, Esc to cancel)" \
+                --prompt="$UI_CURSOR" --placeholder "$suggested" --value "$prefill")"; then
+            _cancel_and_exit
         fi
         [[ -z "$value" ]] && value="$suggested"
 
@@ -666,311 +798,225 @@ session_name_step () {
 }
 
 ###############################################################################
-# Config menu (grouped by context)
+# Configuration screen (Tipo Configuracion)
 ###############################################################################
 
-# Edit one variable named by $1 with a gum choose ($3.. = options) or gum input.
-_cfg_edit_choice () {
-    local var="$1" header="$2"
-    shift 2
-    local new
-    ui_screen "configuration"
-    new="$(gum choose --header "$header" --selected "${!var}" -- "$@")" && printf -v "$var" '%s' "$new"
-}
-
+# Edit one variable with gum input, validating and auto-saving on success.
 _cfg_edit_input () {
-    local var="$1" header="$2"
-    local new
-    ui_screen "configuration"
-    new="$(gum input --header "$header" --value "${!var}")" && printf -v "$var" '%s' "$new"
+    local var="$1" header="$2" new err=""
+    while true; do
+        render_page "Configuration"
+        [[ -n "$err" ]] && printf '%s\n' "$(ui_notify "$err")"
+        ui_gap
+        new="$(gum input --header "$header" --prompt="$UI_CURSOR" --value "${!var}")" || return 0
+        printf -v "$var" '%s' "$new"
+        if err="$(validate_settings_soft 2>&1)"; then
+            save_config
+            load_config
+            return 0
+        fi
+    done
 }
 
-config_menu_codecs () {
+# Same, editing a player detection field: forces player_profile=custom BEFORE
+# saving, so load_config does not immediately revert the edit back to Spotify.
+_cfg_edit_detection_input () {
+    local var="$1" header="$2" new err=""
     while true; do
-        ui_screen "configuration"
-        case "$(gum choose --header "Codecs" -- \
+        render_page "Configuration"
+        [[ -n "$err" ]] && printf '%s\n' "$(ui_notify "$err")"
+        ui_gap
+        new="$(gum input --header "$header" --prompt="$UI_CURSOR" --value "${!var}")" || return 0
+        printf -v "$var" '%s' "$new"
+        player_profile="custom"
+        if err="$(validate_settings_soft 2>&1)"; then
+            save_config
+            load_config
+            return 0
+        fi
+    done
+}
+
+_cfg_edit_choice () {
+    local var="$1" header="$2"; shift 2
+    local new err=""
+    while true; do
+        render_page "Configuration"
+        [[ -n "$err" ]] && printf '%s\n' "$(ui_notify "$err")"
+        ui_gap
+        new="$(gum choose --header "$header" --cursor="$UI_CURSOR" --selected "${!var}" -- "$@")" || return 0
+        printf -v "$var" '%s' "$new"
+        if err="$(validate_settings_soft 2>&1)"; then
+            save_config
+            load_config
+            return 0
+        fi
+    done
+}
+
+config_group_codecs () {
+    local choice
+    while true; do
+        render_page "Configuration"
+        ui_gap
+        choice="$(gum choose --header "Codecs" --cursor="$UI_CURSOR" -- \
             "Record Format:  $record_format" \
             "AAC Profile:  $aac_profile" \
             "Bitrate:  $bitrate" \
-            "< Back")" in
+            "< Back")" || return
+        case "$choice" in
             "Record Format:"*) _cfg_edit_choice record_format "Record format" aac ogg ;;
             "AAC Profile:"*)   _cfg_edit_input  aac_profile "AAC profile (applies to aac only)" ;;
             "Bitrate:"*)       _cfg_edit_input  bitrate "Bitrate (kbps)" ;;
-            *)                 return ;;
+            *) return ;;
         esac
     done
 }
 
-config_menu_paths () {
-    local d
+config_group_paths () {
+    local choice d
     while true; do
-        ui_screen "configuration"
-        case "$(gum choose --header "Paths" -- \
+        render_page "Configuration"
+        ui_gap
+        choice="$(gum choose --header "Paths" --cursor="$UI_CURSOR" -- \
             "Output Folder:  $output_directory" \
             "Filename Scheme:  $filename_scheme" \
-            "< Back")" in
+            "Log Directory:  $(effective_log_directory)" \
+            "< Back")" || return
+        case "$choice" in
             "Output Folder:"*)
                 d="$(pick_directory "${output_directory:-$HOME}")" \
-                    && [[ -n "$d" ]] && { output_directory="$d"; mkdir -p -- "$output_directory"; }
+                    && [[ -n "$d" ]] && { output_directory="$d"; mkdir -p -- "$output_directory"; save_config; load_config; }
                 ;;
             "Filename Scheme:"*)
                 _cfg_edit_choice filename_scheme "Filename scheme" normal strict strict-lc-nodir
+                ;;
+            "Log Directory:"*)
+                _cfg_edit_input log_directory "Log directory (leave empty for the default: ${TMPDIR:-/tmp}/loopcatcher)"
                 ;;
             *) return ;;
         esac
     done
 }
 
-config_menu_player () {
-    local p
+config_group_player () {
+    local choice p
     while true; do
-        ui_screen "configuration"
-        case "$(gum choose --header "Player" -- \
+        render_page "Configuration"
+        ui_gap
+        choice="$(gum choose --header "Player" --cursor="$UI_CURSOR" -- \
             "Player Profile:  $player_profile" \
             "Sink App Name:  $sink_app_name" \
             "MPRIS Bus:  $player_mpris_bus" \
             "Sink Match:  $player_sink_match" \
             "Null Sink Name:  $nulloutput_name" \
-            "< Back")" in
+            "< Back")" || return
+        case "$choice" in
             "Player Profile:"*)
-                ui_screen "configuration"
-                p="$(gum choose --header "Player profile" --selected "$player_profile" -- spotify custom)" \
-                    && player_profile_apply "$p"
+                render_page "Configuration"
+                ui_gap
+                p="$(gum choose --header "Player profile" --cursor="$UI_CURSOR" --selected "$player_profile" -- spotify custom)" \
+                    && { player_profile_apply "$p"; save_config; load_config; }
                 ;;
-            # Editing a detection field means this is no longer the stock Spotify
-            # profile - flip to "custom" so the edit is persisted, not reverted.
-            "Sink App Name:"*) _cfg_edit_input sink_app_name    "Sink app name"                          && player_profile="custom" ;;
-            "MPRIS Bus:"*)     _cfg_edit_input player_mpris_bus "MPRIS bus name"                          && player_profile="custom" ;;
-            "Sink Match:"*)    _cfg_edit_input player_sink_match "Sink match (space-separated globs)"      && player_profile="custom" ;;
+            "Sink App Name:"*)  _cfg_edit_detection_input sink_app_name    "Sink app name" ;;
+            "MPRIS Bus:"*)      _cfg_edit_detection_input player_mpris_bus "MPRIS bus name" ;;
+            "Sink Match:"*)     _cfg_edit_detection_input player_sink_match "Sink match (space-separated globs)" ;;
             "Null Sink Name:"*) _cfg_edit_input nulloutput_name "Null sink name" ;;
             *) return ;;
         esac
     done
 }
 
-config_menu_advanced () {
+config_group_advanced () {
+    local choice
     while true; do
-        ui_screen "configuration"
-        case "$(gum choose --header "Advanced" -- \
+        render_page "Configuration"
+        ui_gap
+        choice="$(gum choose --header "Advanced" --cursor="$UI_CURSOR" -- \
             "Tail Drain Seconds:  $tail_drain_seconds" \
-            "Debug:  $debug" \
-            "< Back")" in
+            "Log Level:  $log_level" \
+            "< Back")" || return
+        case "$choice" in
             "Tail Drain Seconds:"*) _cfg_edit_input tail_drain_seconds "Tail drain seconds (e.g. 0.35)" ;;
-            "Debug:"*)              _cfg_edit_choice debug "Debug" false true ;;
-            *)                      return ;;
+            "Log Level:"*)          _cfg_edit_choice log_level "Log level (0=off, 1=on, 2=debug)" 0 1 2 ;;
+            *) return ;;
         esac
     done
 }
 
-config_menu () {
-    require_tty "config menu"
-    local verr
+# Reachable only from the Welcome screen; returning here always goes back to it.
+config_screen () {
+    local choice
     while true; do
-        ui_screen "configuration"
-        case "$(gum choose --header "Select a group" -- \
-            "Codecs" "Paths" "Player" "Advanced" \
-            "Save & Exit" "Discard & Exit")" in
-            Codecs)   config_menu_codecs ;;
-            Paths)    config_menu_paths ;;
-            Player)   config_menu_player ;;
-            Advanced) config_menu_advanced ;;
-            "Save & Exit")
-                if verr="$(validate_settings_soft 2>&1)"; then
-                    save_config
-                    break
-                fi
-                ui_screen "configuration"
-                ui_box "$verr"
-                [[ "$(gum choose --header "Invalid values" -- "Keep editing" "Discard & Exit")" == "Discard & Exit" ]] && break
-                ;;
-            "Discard & Exit") break ;;
-            *) break ;;
+        render_page "Configuration" \
+            "$(ui_notify \
+                "Every option below is saved automatically as soon as you change it" \
+                "You can also edit the config file directly:" \
+                "" \
+                "$config_path")"
+        ui_gap
+        choice="$(gum choose --header "Select a group" --cursor="$UI_CURSOR" -- \
+            "Codecs" "Paths" "Player" "Advanced" "< Back")" || return
+        case "$choice" in
+            Codecs)   config_group_codecs ;;
+            Paths)    config_group_paths ;;
+            Player)   config_group_player ;;
+            Advanced) config_group_advanced ;;
+            *) return ;;
         esac
     done
-    tui_set "message" "Config menu closed"
 }
 
 ###############################################################################
-# Onboarding (first run only)
+# Recording Wizard
 ###############################################################################
 
-_onboarding_abort () {
-    ui_screen "first-run setup"
-    ui_box "Onboarding cancelled."
-    exit 0
+wizard_step_screen () {
+    local n="$1" spinner="$2" kind="$3" heading="$4"; shift 4
+    local spin_title
+    case "$kind" in
+        sink)    spin_title="Waiting for the audio sink..." ;;
+        stopped) spin_title="Waiting for playback to pause..." ;;
+        playing) spin_title="Waiting for playback to start..." ;;
+        *)       spin_title="Waiting..." ;;
+    esac
+
+    render_page "Recording Wizard" \
+        "$(ui_box "$(ui_subtitle "Step $n: $heading")" "" "$@")"
+    ui_gap
+
+    gum spin --spinner "$spinner" --title "$spin_title" -- \
+        "$0" --internal-wait "$kind" --config "$config_path" \
+        || _cancel_and_exit
 }
 
-onboarding_wizard () {
-    require_tty "onboarding"
-    local p verr od
-
-    while true; do
-        ui_screen "first-run setup" "This is shown only once."
-        p="$(gum choose --header "Player profile" -- Spotify Custom)" || _onboarding_abort
-        case "$p" in
-            Spotify)
-                player_profile_apply spotify
-                ;;
-            Custom)
-                player_profile_apply custom
-                ui_screen "first-run setup"
-                sink_app_name="$(gum input --header "sink_app_name" --value "$sink_app_name")" || _onboarding_abort
-                ui_screen "first-run setup"
-                player_mpris_bus="$(gum input --header "player_mpris_bus" --value "$player_mpris_bus")" || _onboarding_abort
-                ui_screen "first-run setup"
-                player_sink_match="$(gum input --header "player_sink_match (space-separated globs)" --value "$player_sink_match")" || _onboarding_abort
-                ;;
-        esac
-
-        ui_screen "first-run setup"
-        record_format="$(gum choose --header "Codec" --selected "$record_format" -- aac ogg)" || _onboarding_abort
-        ui_screen "first-run setup"
-        aac_profile="$(gum input --header "AAC profile (applies to aac only)" --value "$aac_profile")" || _onboarding_abort
-        ui_screen "first-run setup"
-        bitrate="$(gum input --header "Bitrate (kbps)" --value "$bitrate")" || _onboarding_abort
-        ui_screen "first-run setup"
-        filename_scheme="$(gum choose --header "Filename scheme" --selected "$filename_scheme" -- \
-            normal strict strict-lc-nodir)" || _onboarding_abort
-
-        ui_screen "first-run setup"
-        od="$(gum choose --header "Output directory" -- "XDG Music folder" "Choose...")" || _onboarding_abort
-        case "$od" in
-            "Choose...") output_directory="$(pick_directory "$HOME")" || output_directory="" ;;
-            *)           output_directory="" ;;
-        esac
-
-        ui_screen "summary"
-        ui_box \
-            "Player profile     $player_profile" \
-            "sink_app_name      $sink_app_name" \
-            "player_mpris_bus   $player_mpris_bus" \
-            "player_sink_match  $player_sink_match" \
-            "Codec              $record_format" \
-            "AAC profile        $aac_profile" \
-            "Bitrate            ${bitrate}k" \
-            "Filename scheme    $filename_scheme" \
-            "Output directory   ${output_directory:-<XDG Music folder>}" \
-            "Config             $config_path"
-
-        gum choose --header "Onboarding complete" -- "Continue" >/dev/null || _onboarding_abort
-
-        if verr="$(validate_settings_soft 2>&1)"; then
-            save_config
-            return 0
-        fi
-        ui_box "$verr" "Please review the values."
-    done
-}
-
-###############################################################################
-# No-sink wizard
-###############################################################################
-
-_wizard_cancel () {
-    printf 'Cancelled.\n' >&2
-    exit 0
-}
-
-# Poll $1 (a command) every second until it succeeds; q / Ctrl-C cancels.
-_wizard_wait_until () {
-    local _k
-    until "$@"; do
-        [[ $should_exit -eq 1 ]] && _wizard_cancel
-        IFS= read -rsn1 -t 1 _k && [[ "$_k" == [qQ] ]] && _wizard_cancel
-    done
-}
-
-_playback_is_playing () {
-    [[ "$(player_playback_status)" == "Playing" ]]
-}
-
-_playback_is_stopped () {
-    [[ "$(player_playback_status)" != "Playing" ]]
-}
-
-no_sink_wizard () {
-    require_tty "sink setup"
+recording_wizard () {
     local label
     label="$(player_profile_label "$player_profile")"
 
-    # 1. Wait for the player sink-input to appear.
-    wizard_step_screen "Step 1: Create the Audio Sink" \
-        "1) Open your $label" \
-        "2) Play any track that is NOT the first in your playlist or album you want to record"
-    _wizard_wait_until get_target_sink_index
-
-    # 2. Wait until playback is actually running (primes the sink + MPRIS).
-    _wizard_wait_until _playback_is_playing
-
-    # 3. Ask the user to pause, wait for it.
-    wizard_step_screen "Step 2: Prepare to record" \
-        "1) Pause the playback on your $label"
-    _wizard_wait_until _playback_is_stopped
-}
-
-###############################################################################
-# Menu / about / license
-###############################################################################
-
-pkg_meta_text () {
-    local mode="${1:-about}" d
-    if dpkg-query -W -f='${Version}' loopcatcher >/dev/null 2>&1; then
-        printf '# loopcatcher (installed Debian package)\n\n'
-        dpkg-query -W \
-            -f='Version:     ${Version}\nMaintainer:  ${Maintainer}\nHomepage:    ${Homepage}\n\n${Description}\n' \
-            loopcatcher
-        if [[ "$mode" == "license" && -r /usr/share/doc/loopcatcher/copyright ]]; then
-            printf '\n\n----- /usr/share/doc/loopcatcher/copyright -----\n\n'
-            cat /usr/share/doc/loopcatcher/copyright
-        fi
-        return
+    if ! get_target_sink_index; then
+        wizard_step_screen 1 points sink "Create the Audio Sink" \
+            "1) Open your $label" \
+            "2) Play any track that is NOT the first in your playlist or album you want to record"
+        get_target_sink_index || true
     fi
 
-    d="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-    printf '# loopcatcher %s (running from source)\n\n' "$SCRIPT_VERSION"
-    if [[ "$mode" == "about" && -r "$d/README.md" ]]; then
-        head -n 40 "$d/README.md"
-        printf '\n'
+    if ! _playback_is_stopped; then
+        wizard_step_screen 2 points stopped "Prepare to record" \
+            "1) Pause the playback on your $label"
     fi
-    if [[ -r "$d/LICENSE" ]]; then
-        printf '\n----- LICENSE -----\n\n'
-        cat "$d/LICENSE"
-    else
-        printf '(LICENSE not found)\n'
+
+    # By this point playback is confirmed paused/stopped (step 2 guaranteed it,
+    # or it already was). Start listening for MPRIS signals now, before the
+    # user presses Play again, so the Playing transition and the first track's
+    # metadata - both one-shot signals - are not missed.
+    coproc DBUS_MONITOR { get_dbusmessages "path=/org/mpris/MediaPlayer2,member=PropertiesChanged,sender=$player_mpris_bus"; }
+    dbus_monitor_pid=$!
+
+    if ! _playback_is_playing; then
+        wizard_step_screen 3 points playing "Start recording" \
+            "1) Play the first track of your playlist or album to start the recording automatically"
     fi
-}
-
-menu_action () {
-    case "$1" in
-        Config)          config_menu ;;
-        "Reload config") reload_config ;;
-        # gum pager runs its own alternate screen; drop back to the normal
-        # screen around it so its exit does not leave us off our status buffer.
-        About)           screen_leave; pkg_meta_text about   | gum pager --soft-wrap; screen_enter ;;
-        License)         screen_leave; pkg_meta_text license | gum pager --soft-wrap; screen_enter ;;
-        Quit)            should_exit=1 ;;
-        *)               : ;;
-    esac
-}
-
-open_menu () {
-    local choice
-    # Suppress WINCH so a resize cannot repaint the status view over the menu.
-    # The menu draws on the same alternate screen as the status view (no screen
-    # swap) so opening it costs one clear, not two screen transitions.
-    trap '' WINCH
-    ui_clear
-    ui_title "loopcatcher  -  menu"
-    printf '\n\n'
-    # gum filter lets you type part of an option to pick it.
-    choice="$(gum filter --header "Type to filter, Enter to select" --height 8 -- \
-        "Resume" "Config" "Reload config" "About" "License" "Quit")" || choice="Resume"
-    menu_action "$choice"
-    trap 'status_dirty=1' WINCH
-    status_chrome_init          # config menu may have moved output_directory
-    _status_last_frame=""       # the menu overwrote the screen - force a repaint
-    status_dirty=0
-    status_render
 }
 
 ###############################################################################
@@ -1015,7 +1061,7 @@ get_target_sink_index () {
             sink_app="$(cut -d '"' -f2 <<< "$line")"
             if is_target_sink_app "$sink_app_name" "$sink_app"; then
                 source_sink_index="$sink_index"
-                msg "Matched target sink: $sink_app" "debug"
+                log_debug "matched target sink: $sink_app"
                 return 0
             fi
         fi
@@ -1035,7 +1081,7 @@ ensure_target_routed () {
     # Non-fatal so a transient failure does not kill the run.
     get_target_sink_index || return 1
     if ! pactl move-sink-input "$source_sink_index" "$nulloutput_name" 2>/dev/null; then
-        msg "Could not move sink-input $source_sink_index to '$nulloutput_name'"
+        log_line "could not move sink-input $source_sink_index to '$nulloutput_name'"
         return 1
     fi
     return 0
@@ -1166,8 +1212,8 @@ get_dbusmessages () {
                 *'string "PlaybackStatus"'*)     expect_key="playbackstatus"; expect_type="string"; continue ;;
                 *'string "mpris:trackid"'*)      expect_key="trackid";        expect_type="string"; continue ;;
                 *'string "xesam:album"'*)        expect_key="album";          expect_type="string"; continue ;;
-                *'string "xesam:albumArtist"'*)  expect_key="albumartist";    expect_type="string"; continue ;;
-                *'string "xesam:artist"'*)       expect_key="artist";         expect_type="string"; continue ;;
+                *'string "xesam:albumArtist"'*)  expect_key="albumartist";    expect_type="string";       continue ;;
+                *'string "xesam:artist"'*)       expect_key="artist";         expect_type="string_array";  continue ;;
                 *'string "xesam:discNumber"'*)   expect_key="discnumber";     expect_type="int32";  continue ;;
                 *'string "xesam:title"'*)        expect_key="title";          expect_type="string"; continue ;;
                 *'string "xesam:trackNumber"'*)  expect_key="tracknumber";    expect_type="int32";  continue ;;
@@ -1178,8 +1224,22 @@ get_dbusmessages () {
             if [[ "$expect_type" == "string" ]] && [[ $line == *'string "'* ]]; then
                 printf '%s -> %s\n' "$expect_key" "$(cut -d '"' -f2 <<< "$line")"
                 expect_key=""; expect_type=""
+            elif [[ "$expect_type" == "string_array" ]] && [[ $line == *']'* ]]; then
+                # End of the "xesam:artist" array (a bare "]" line) - stop
+                # matching further elements, without emitting a bogus one.
+                expect_key=""; expect_type=""
+            elif [[ "$expect_type" == "string_array" ]] && [[ $line == *'string "'* ]]; then
+                # One element of the "xesam:artist" array - unlike a scalar
+                # "string" field, do NOT clear expect_key/expect_type here,
+                # so every remaining element up to the closing "]" is also
+                # emitted under the same "artist" key.
+                printf '%s -> %s\n' "$expect_key" "$(cut -d '"' -f2 <<< "$line")"
             elif [[ "$expect_type" == "int32" ]] && [[ $line == *'int32 '* ]]; then
-                printf '%s -> %s\n' "$expect_key" "$(awk '{print $2}' <<< "$line")"
+                # Value sits after the LAST "int32 " token, not at a fixed
+                # field position - the "variant" prefix column width varies,
+                # which previously made "awk '{print $2}'" print "int32"
+                # itself instead of the number.
+                printf '%s -> %s\n' "$expect_key" "${line##*int32 }"
                 expect_key=""; expect_type=""
             fi
         done < <(dbus-monitor "$rule" 2>/dev/null)
@@ -1208,7 +1268,7 @@ stop_current_recording () {
     local fifo_dir="$record_fifo_dir"
     local old_encoder="$encoder_pid"
     local old_parec="$parec_pid"
-    local waited=0
+    local waited=0 duration=""
 
     [[ "$stopping_recording" == "true" ]] && return
     stopping_recording=true
@@ -1222,6 +1282,10 @@ stop_current_recording () {
         kill "$old_parec" 2>/dev/null || true
     fi
 
+    # Capture duration is measured here, right as capture actually stops - not
+    # after the encoder-finalize wait below, which is not part of the audio.
+    [[ -n "$record_log_file" ]] && duration=$((SECONDS - record_start_seconds))
+
     parec_pid=""
     encoder_pid=""
     record_fifo_dir=""
@@ -1234,6 +1298,12 @@ stop_current_recording () {
         if kill -0 "$old_encoder" 2>/dev/null; then
             kill "$old_encoder" 2>/dev/null || true
         fi
+    fi
+
+    if [[ -n "$record_log_file" ]]; then
+        log_recording "$record_log_artist" "$record_log_album" "$record_log_title" \
+            "$record_log_tracknumber" "$record_log_discnumber" "$record_log_file" "$duration"
+        record_log_file=""
     fi
 
     # Safe to remove now: an unlinked FIFO / log stays valid for a background
@@ -1257,7 +1327,8 @@ start_recording () {
     stop_current_recording
 
     if ! ensure_target_routed; then
-        msg "Could not route target sink to monitor output"
+        recording_failed=true; status_dirty=1
+        log_line "could not route target sink to monitor output"
         return 1
     fi
 
@@ -1265,16 +1336,35 @@ start_recording () {
     record_fifo_dir="$(mktemp -d)"
     record_fifo="$record_fifo_dir/pcm"
     if ! mkfifo "$record_fifo" 2>/dev/null; then
-        msg "Could not create capture pipe under $record_fifo_dir"
+        log_line "could not create capture pipe under $record_fifo_dir"
         stop_current_recording
         return 1
     fi
+
+    log_debug "encoder command: format=$record_format aac_profile=$aac_profile bitrate=${bitrate}k output=$outputfile"
+
+    # OGG (unlike MP4/AAC) genuinely supports multiple ARTIST= comment
+    # fields on one file. "oggenc --artist" doesn't add one, though - it
+    # associates one artist per input FILE when repeated across a batch, not
+    # multiple values on a single file - so every captured xesam:artist goes
+    # through "-c ARTIST=..." instead, once per value. Falls back to
+    # "--artist $i_artist" only if artist_all is empty (e.g. start_recording
+    # invoked directly, bypassing the MPRIS parser, as tests do).
+    local -a ogg_artist_args=()
+    local _a
+    for _a in "${artist_all[@]}"; do
+        [[ -n "$_a" ]] && ogg_artist_args+=(-c "ARTIST=$_a")
+    done
+    [[ ${#ogg_artist_args[@]} -eq 0 ]] && ogg_artist_args=(--artist "$i_artist")
 
     # Encoder first (blocks on the pipe until parec writes), then capture.
     # Separately tracked processes let us stop capture first on shutdown so the
     # encoder can flush and finalize instead of being killed mid-stream.
     case "$record_format" in
         aac)
+            # MP4's ©ART atom holds one string, not a repeatable list, so AAC
+            # is tagged with only the first artist - same simplification as
+            # the session log and file/folder naming.
             fdkaac -R -S -p "$aac_profile" --bitrate "${bitrate}k" --moov-before-mdat --afterburner 1 \
                 --title "$i_title" --artist "$i_artist" --album "$i_album" --album-artist "$i_albumartist" \
                 --track "$i_tracknumber" --disk "$i_discnumber" \
@@ -1283,12 +1373,13 @@ start_recording () {
             ;;
         ogg)
             oggenc -b "$bitrate" --raw \
-                --title "$i_title" --artist "$i_artist" --album "$i_album" --tracknum "$i_tracknumber" \
+                --title "$i_title" "${ogg_artist_args[@]}" --album "$i_album" --tracknum "$i_tracknumber" \
                 - -o "$outputfile" < "$record_fifo" 2>"$record_error_log" &
             encoder_pid=$!
             ;;
         *)
-            msg "Invalid record_format '$record_format'"
+            recording_failed=true; status_dirty=1
+            log_line "invalid record_format '$record_format'"
             stop_current_recording
             return 1
             ;;
@@ -1305,17 +1396,23 @@ start_recording () {
         kill "$parec_pid" "$encoder_pid" 2>/dev/null || true
         stop_current_recording
         [[ -n "$outputfile" ]] && rm -f "$outputfile"
-        if [[ -n "$err" ]]; then
-            msg "Recorder failed to start: $err"
-        else
-            msg "Recorder failed to start. Check codec dependencies and format settings."
-        fi
+        recording_failed=true; status_dirty=1
+        log_line "recorder failed to start: ${err:-check codec dependencies and format settings}"
         return 1
     fi
 
-    tui_set "state" "recording"
+    recording_failed=false; status_dirty=1
     tui_set "output" "$outputfile"
-    tui_set "message" "Recording '$i_title' by '$i_artist'"
+
+    # Logged once this recording actually stops (see stop_current_recording),
+    # so the log entry can include the real capture duration.
+    record_start_seconds=$SECONDS
+    record_log_artist="$i_artist"
+    record_log_album="$i_album"
+    record_log_title="$i_title"
+    record_log_tracknumber="$i_tracknumber"
+    record_log_discnumber="$i_discnumber"
+    record_log_file="$outputfile"
     return 0
 }
 
@@ -1336,19 +1433,28 @@ maybe_start_recording () {
 process_dbus_line () {
     local dbus_read="$1"
 
+    # None of the branches below decide whether to (re)start recording -
+    # that happens once per drain batch, in recording_main_loop, after every
+    # currently-buffered line has been applied. A single MPRIS metadata
+    # update emits its keys (album, artist, title, trackNumber, ...) as
+    # several consecutive lines; deciding inline on whichever of title/
+    # artist/album happens to complete the pair first raced ahead of
+    # later keys in the same burst (trackNumber, in particular, is emitted
+    # after title) and locked in a stale/empty value for the rest of the
+    # track.
     case "$dbus_read" in
         'playbackstatus -> '*)
             playbackstatus="${dbus_read#playbackstatus -> }"
+            status_dirty=1
             if [[ "$playbackstatus" == "Playing" ]]; then
                 started_playing=true
-                maybe_start_recording
             elif [[ "$started_playing" == "true" ]]; then
                 # Any non-Playing state after playback began ends the session
                 # (no half tracks; also where Spotify lands when a playlist
                 # finishes). A pause before the first Playing is ignored.
                 stop_current_recording "drain"
                 active_recording_signature=""
-                finish_session_and_exit "Playback '$playbackstatus'. Session finished."
+                end_session
             fi
             ;;
         'trackid -> '*)
@@ -1357,19 +1463,171 @@ process_dbus_line () {
                 last_trackid="$trackid"
                 active_recording_signature=""
                 title="" artist="" album="" albumartist="" tracknumber="" discnumber=""
+                artist_all=()
                 stop_current_recording
-                tui_set "state" "monitoring"
-                tui_set "message" "Track change detected. Waiting for metadata..."
             fi
-            maybe_start_recording
             ;;
-        'title -> '*)       title="${dbus_read#title -> }";             tui_set "track" "$title";   maybe_start_recording ;;
-        'artist -> '*)      artist="${dbus_read#artist -> }";           tui_set "artist" "$artist"; maybe_start_recording ;;
-        'album -> '*)       album="${dbus_read#album -> }";             tui_set "album" "$album";   maybe_start_recording ;;
+        'title -> '*)       title="${dbus_read#title -> }";             tui_set "track" "$title" ;;
+        'artist -> '*)
+            local _artist_value="${dbus_read#artist -> }"
+            # First xesam:artist element of this track becomes the scalar
+            # "artist" (naming/log/AAC tag); every element - first included -
+            # is also collected into artist_all (table display/OGG tags).
+            [[ ${#artist_all[@]} -eq 0 ]] && artist="$_artist_value"
+            artist_all+=("$_artist_value")
+            tui_set "artist" "$(join_artist_list)"
+            ;;
+        'album -> '*)       album="${dbus_read#album -> }";             tui_set "album" "$album" ;;
         'albumartist -> '*) albumartist="${dbus_read#albumartist -> }" ;;
-        'tracknumber -> '*) tracknumber="${dbus_read#tracknumber -> }" ;;
-        'discnumber -> '*)  discnumber="${dbus_read#discnumber -> }" ;;
+        'tracknumber -> '*) tracknumber="${dbus_read#tracknumber -> }"; tui_set "tracknumber" "$tracknumber" ;;
+        'discnumber -> '*)  discnumber="${dbus_read#discnumber -> }";   tui_set "discnumber" "$discnumber" ;;
     esac
+}
+
+###############################################################################
+# Recording screen
+###############################################################################
+
+# Every captured xesam:artist value, joined with "; " - used for the
+# Metadata table and for OGG tagging (which writes them back out as separate
+# ARTIST= comment fields). Naming, the session log, and the AAC tag use only
+# the first value (the scalar "artist"), never this.
+join_artist_list () {
+    local joined="" a
+    for a in "${artist_all[@]}"; do
+        [[ -z "$joined" ]] && joined="$a" || joined="$joined; $a"
+    done
+    printf '%s' "$joined"
+}
+
+tui_set () {
+    case "$1" in
+        track)       tui_track="$2" ;;
+        artist)      tui_artist="$2" ;;
+        album)       tui_album="$2" ;;
+        tracknumber) tui_tracknumber="$2" ;;
+        discnumber)  tui_discnumber="$2" ;;
+        output)      tui_output="$2" ;;
+    esac
+    status_dirty=1
+    return 0
+}
+
+# tui_output made relative to the session folder (Artist/Album/File).
+status_output_relpath () {
+    local f="${tui_output:--}"
+    if [[ "$f" == "-" || -z "$f" ]]; then
+        printf -- '-'
+    elif [[ -n "$session_output_directory" && "$f" == "$session_output_directory/"* ]]; then
+        printf '%s' "${f#"$session_output_directory"/}"
+    else
+        printf '%s' "$f"
+    fi
+}
+
+_kill_spinner () {
+    if [[ -n "$_spinner_pid" ]]; then
+        kill "$_spinner_pid" 2>/dev/null || true
+        wait "$_spinner_pid" 2>/dev/null || true
+    fi
+    _spinner_pid=""
+}
+
+recording_screen_render () {
+    [[ -t 1 ]] || return
+    _kill_spinner
+
+    local info meta status frame catcher_status="Recording"
+    [[ "$recording_failed" == "true" ]] && catcher_status="Failed"
+
+    info="$(ui_kv_table 'Info' '' \
+        'Output Folder' "$(clip_text "${output_directory:--}")" \
+        'Session Name' "$(clip_text "${session_name:--}")" \
+        'Config File' "$(clip_text "$config_path")" \
+        'Audio Sink' "${source_sink_index:--}")"
+
+    meta="$(ui_kv_table 'Metadata' '' \
+        'Artist' "$(clip_text "${tui_artist:--}")" \
+        'Album' "$(clip_text "${tui_album:--}")" \
+        'Track' "$(clip_text "${tui_track:--}")" \
+        'Track No.' "$(clip_text "${tui_tracknumber:--}")" \
+        'Disc No.' "$(clip_text "${tui_discnumber:--}")" \
+        'Output File' "$(clip_text "$(status_output_relpath)")")"
+
+    # Playback Status is printed exactly as MPRIS reports it (Playing/Paused/
+    # Stopped/...), with no relabelling.
+    status="$(ui_kv_table 'Status' '' \
+        'Catcher Status' "$catcher_status" \
+        'Playback Status' "$playbackstatus")"
+
+    printf -v frame '%s\n%s\n%s\n%s\n' \
+        "$(ui_title_row 'Recording')" "$info" "$meta" "$status"
+
+    paint_frame "$frame"
+    ui_gap
+
+    gum spin --spinner dot --title "${catcher_status}..." -- sleep 999999 &
+    _spinner_pid=$!
+}
+
+end_session () {
+    session_ended=true
+    should_exit=1
+}
+
+recording_main_loop () {
+    # Snapshot the coproc fd: bash may unset the DBUS_MONITOR array once the
+    # coprocess exits, and "set -u" would then abort on ${DBUS_MONITOR[0]}.
+    local dbus_fd="${DBUS_MONITOR[0]}"
+    local dbus_read last_liveness=$SECONDS
+
+    while [[ $should_exit -eq 0 ]]; do
+        if ! kill -0 "$dbus_monitor_pid" 2>/dev/null; then
+            exit_note="loopcatcher: dbus-monitor ended, session stopped."
+            break
+        fi
+
+        # Drain every line already buffered before repainting, so a metadata
+        # burst (trackid + title + artist + album) collapses into ONE repaint.
+        local dbus_activity=0
+        while IFS= read -r -t 0.2 -u "$dbus_fd" dbus_read 2>/dev/null; do
+            process_dbus_line "$dbus_read"
+            dbus_activity=1
+            [[ $should_exit -eq 0 ]] || break
+        done
+
+        # Decide once per drain batch, after every buffered key of the burst
+        # has been applied - not per key line - so a field emitted later in
+        # the same MPRIS update (trackNumber comes after title) is already
+        # in place before recording is (re)started.
+        [[ $dbus_activity -eq 1 && $should_exit -eq 0 ]] && maybe_start_recording
+
+        # Catch a player that quit outright (no Paused/Stopped signal reaches
+        # the still-running dbus-monitor). Checked on a ~2s wall-clock timer.
+        if [[ $should_exit -eq 0 && $(( SECONDS - last_liveness )) -ge 2 ]]; then
+            last_liveness=$SECONDS
+            poll_player_liveness
+        fi
+
+        # One repaint per tick, only when something changed.
+        if [[ $status_dirty -eq 1 && $should_exit -eq 0 ]]; then
+            status_dirty=0
+            recording_screen_render
+        fi
+    done
+}
+
+###############################################################################
+# Finish screen
+###############################################################################
+
+finish_screen () {
+    render_page_plain "Recording Finished" \
+        "$(ui_notify "Recording session finished")" \
+        "$(ui_box "Your recordings are saved in:" "" "$session_output_directory")"
+    ui_gap
+    printf '%s\n' "$(gum style --bold -- 'Press any key to exit.')"
+    read -rsn1 || true
 }
 
 ###############################################################################
@@ -1387,6 +1645,7 @@ remove_null_sink () {
 }
 
 cleanup () {
+    _kill_spinner
     # "drain" so a manual quit mid-track still finalizes the current file.
     stop_current_recording "drain"
     if [[ -n "$dbus_monitor_pid" ]] && kill -0 "$dbus_monitor_pid" 2>/dev/null; then
@@ -1395,15 +1654,7 @@ cleanup () {
     remove_null_sink
     screen_leave
     printf '\033[0m'
-
-    if [[ "$status_active" == "true" && -t 1 ]]; then
-        # The status view ran interactively - the "finished" screen already
-        # showed the details, so just leave a clean terminal.
-        ui_clear
-    elif [[ "$tui_state" == "session-ended" ]]; then
-        # Headless: no "finished" screen was shown, so print the summary.
-        printf '%s\nFiles in: %s\n' "$tui_last_message" "${session_output_directory:-$output_directory}"
-    fi
+    [[ -t 1 ]] && ui_clear
     [[ -n "$exit_note" ]] && printf '%s\n' "$exit_note" >&2
     return 0
 }
@@ -1418,16 +1669,18 @@ get_options () {
 Usage: ${0##*/} [options]
 
 Behavior:
-  - If output-directory is omitted, first run uses the XDG Music folder and saves it.
-  - Session name is asked interactively (prefilled with a timestamp; just press Enter).
-    Provide --session to skip the prompt.
+  - The Welcome screen shows the current (or default) configuration; accept it
+    or open the Configuration screen to change it.
+  - Session name is asked interactively (prefilled with a timestamp; just press
+    Enter). Provide --session to skip the prompt.
   - Output goes to: output-directory/session-name
-  - Session ends automatically when playback becomes pause/stop.
-  - First run only: a one-time gum onboarding wizard (player profile, codec, bitrate,
-    filename scheme, output directory). It never reappears once the config file exists.
+  - The Recording Wizard walks you through creating the audio sink, pausing,
+    then starting playback to begin recording automatically.
+  - The session ends automatically when playback pauses, stops, or the player
+    quits.
 
 Options:
-  --debug                   Enable debug logging
+  --debug                   Set log_level to 2 (adds encoder diagnostics to the session log)
   --output <dir>            Output directory
   --session <name>          Session name (skips the prompt)
   --format <format>         Record format: aac or ogg
@@ -1435,16 +1688,14 @@ Options:
   --bitrate <kbps>          Bitrate target
   --scheme <scheme>         Filename scheme: normal, strict, strict-lc-nodir
   --config <path>           Override config file path
-  --no-intro                Skip the first-run onboarding wizard (writes defaults)
   --help                    Show help
   --version                 Show version
 "
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --debug)          debug=true; shift ;;
+            --debug)          log_level=2; shift ;;
             --help)           show_help=true; shift ;;
             --version)        show_version=true; shift ;;
-            --no-intro)       no_intro=true; shift ;;
             --output)         [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }; output_directory="$2"; shift 2 ;;
             --output=*)       output_directory="${1#*=}"; shift ;;
             --session)        [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }; session_name="$2"; shift 2 ;;
@@ -1489,100 +1740,77 @@ Options:
 }
 
 ###############################################################################
-# Main
+# Internal worker used by the Recording Wizard's spinner (gum spin wraps this
+# process so the wait animates with a real gum spinner and Ctrl+C cancels it
+# like any other foreground command).
 ###############################################################################
 
-main_loop () {
-    # Snapshot the coproc fd: bash may unset the DBUS_MONITOR array once the
-    # coprocess exits, and "set -u" would then abort on ${DBUS_MONITOR[0]}.
-    local dbus_fd="${DBUS_MONITOR[0]}"
-    local got dbus_read key
-
-    while [[ $should_exit -eq 0 ]]; do
-        if ! kill -0 "$dbus_monitor_pid" 2>/dev/null; then
-            exit_note="loopcatcher: dbus-monitor ended, session stopped."
-            break
-        fi
-
-        got=0
-        # Drain every line already buffered before repainting, so a metadata
-        # burst (trackid + title + artist + album + the recorder's own setters)
-        # collapses into ONE status_render instead of one per line.
-        while IFS= read -r -t 0.2 -u "$dbus_fd" dbus_read 2>/dev/null; do
-            process_dbus_line "$dbus_read"
-            got=1
-            [[ $should_exit -eq 0 ]] || break
-        done
-
-        if [[ $got -eq 0 && $should_exit -eq 0 ]]; then
-            key=""
-            read -rsn1 -t 0.05 key || true
-            if [[ "$key" == [mM] ]]; then
-                open_menu
-            elif [[ "$key" == [qQ] && "$started_playing" != "true" ]]; then
-                # Step 3 of the Recording Wizard: q cancels before the first play.
-                should_exit=1
-            fi
-        fi
-
-        # One repaint per tick, only when something changed (a setter or a
-        # SIGWINCH set the flag). status_render itself no-ops an identical frame.
-        if [[ $status_dirty -eq 1 && $should_exit -eq 0 ]]; then
-            status_dirty=0
-            status_render
-        fi
+_internal_wait () {
+    local kind="$1"; shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config) config_path="$2"; shift 2 ;;
+            *) shift ;;
+        esac
     done
+    load_config
+    case "$kind" in
+        sink)    until get_target_sink_index; do sleep 1; done ;;
+        stopped) until _playback_is_stopped;  do sleep 1; done ;;
+        playing) until _playback_is_playing;  do sleep 1; done ;;
+        *)       return 1 ;;
+    esac
 }
+
+###############################################################################
+# Main
+###############################################################################
 
 main () {
     get_options "$@"
     check_dependencies
+    require_tty "loopcatcher"
 
-    local config_existed=0
-    [[ -f "$config_path" ]] && config_existed=1
     ensure_config_dir
     load_config
     get_options "$@"          # CLI flags win over the config file
     validate_settings
     check_encoder_dependency
 
-    if [[ $config_existed -eq 0 ]]; then
-        if [[ "$no_intro" != "true" && -t 0 && -t 1 ]]; then
-            onboarding_wizard
-            load_config          # re-read the normalized values
-        else
-            save_config          # headless / --no-intro first run: write defaults
-        fi
-    fi
-
+    welcome_screen
     initialize_output_directory
-    session_name_step
+    session_name_screen
     check_audio_server
+    init_session_log
 
     trap cleanup EXIT
     trap 'should_exit=1' INT TERM
 
-    get_target_sink_index || no_sink_wizard
+    recording_wizard
 
     create_null_audio_output
     move_target_output
 
-    status_chrome_init
-    status_active=true
+    # The Recording screen is only ever shown while a session is underway;
+    # Catcher Status starts "Recording" (recording_failed defaults false) - see
+    # "Global state" above.
     screen_enter
     trap 'status_dirty=1' WINCH
 
-    tui_state="monitoring"
-    tui_last_message="Monitoring MPRIS for $(player_profile_label "$player_profile")..."
     status_dirty=0
-    status_render          # first paint is direct; the loop repaints on change
+    recording_screen_render
 
-    coproc DBUS_MONITOR { get_dbusmessages "path=/org/mpris/MediaPlayer2,member=PropertiesChanged,sender=$player_mpris_bus"; }
-    dbus_monitor_pid=$!
+    recording_main_loop
 
-    main_loop
+    _kill_spinner
+    [[ "$session_ended" == "true" ]] && finish_screen
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if [[ "${1:-}" == "--internal-wait" ]]; then
+        shift
+        _internal_wait "$@"
+        exit $?
+    fi
     main "$@"
 fi
