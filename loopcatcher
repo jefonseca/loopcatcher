@@ -2,9 +2,22 @@
 ###############################################################################
 # loopcatcher - record app/system loopback audio to AAC or OGG files.
 #
-# Flow: Welcome (configuration) -> Session Name -> Recording Wizard (3 steps)
+# Flow: Welcome (main menu) -> Session Name -> Recording Wizard (3 steps)
 #       -> Recording screen -> Finish. The session ends automatically when
 #       playback pauses, stops, or the player quits.
+#
+# The Welcome/Settings/Session Name/Finish screens and the encoding/output
+# engine below are fixed and profile-independent. Everything about detecting
+# and monitoring a specific player lives in a loadable "profile module" (see
+# the "Profile modules" section) - profiles/<name>/profile.sh, sourced by
+# load_profile_module(). Only one module ships today: profiles/spotify_native.
+#
+# Every user-facing string is looked up through t() (see "i18n" below) from a
+# catalog sourced once at startup - nothing reloads mid-session (see "Config
+# file"/"Main" below): edits save to disk immediately but the running process
+# keeps whatever it read at launch until the user picks "Apply configuration
+# change" from the Welcome menu (a plain "exec $0") - which only appears once
+# something has actually changed this run (config_changed).
 ###############################################################################
 
 set -u
@@ -29,9 +42,8 @@ fi
 UI_WIDTH=100
 
 # Cursor/prompt marker used on every interactive gum widget in the app: the
-# --cursor on every "gum choose" (the only selection widget used anywhere -
-# "gum filter" looks visually different and is never used, even for long
-# lists) and the --prompt on every "gum input".
+# --cursor on every "gum choose", the --prompt on every "gum input", and (new)
+# the --prompt on "gum filter" (Change Profile - see ELEMENT TYPES below).
 UI_CURSOR="👉 "
 
 # Content width for a single-border element meant to span the full TUI width
@@ -68,13 +80,125 @@ UI_NOTIFY_WIDTH=$UI_BOX_CONTENT_WIDTH
 # $(gum style ...) fragments composed for a screen frame need this.
 export CLICOLOR_FORCE=1
 
-# Built-in "spotify" player profile.
-readonly SPOTIFY_MPRIS_BUS="org.mpris.MediaPlayer2.spotify"
-readonly SPOTIFY_SINK_MATCH="spotify spotify* com.spotify.client com.spotify.client* com.spotify.Client*"
+###############################################################################
+# i18n
+#
+# One pair of associative arrays, MSG_en/MSG_es, keyed by dotted message id,
+# populated one FILE PER LANGUAGE (lang/en.sh, lang/es.sh, ...) rather than
+# one combined file - a translator only ever touches their own language's
+# file. `load_lang_dir <dir>` always sources <dir>/en.sh first (the fallback
+# baseline every id must exist in) then, if a different language is active,
+# <dir>/$language.sh on top of it as an overlay - only the ids that file
+# actually defines get added/overridden, so a translation can lag behind
+# English on newly-added ids without breaking (t() falls back to English for
+# anything missing). Used both for this script's own catalog (lang_root) and
+# for each profile module's own catalog (see "Profile modules" below, and
+# profiles/spotify_native/lang/ for a worked example). t() is the one lookup
+# function, used by the main script and every module alike.
+#
+# lang_root()'s directory is sourced here, at the very top of the script's
+# top-level body (using whatever $language detect_system_language() lands on
+# - the persisted config value, if different, is applied by a second
+# load_lang_dir call inside load_config() once it's known), so even the
+# earliest possible diagnostic (check_dependencies, before main()'s own
+# screens run) can call t(). --help/--version and early dependency FATALs can
+# therefore only ever reflect the auto-detected system language, never a
+# saved-but-not-yet-loaded config preference - an accepted trade-off of not
+# loading every language "just in case".
+###############################################################################
 
-# Shown on the Welcome screen the first time (no config file yet). Kept in a
-# variable so it is easy to customise.
-readonly WELCOME_MESSAGE="Welcome to LoopCatcher. It captures loopback audio from your desktop media player into organized, auto-tagged audio files, ready to use with the default configuration below."
+lang_root () {
+    local script_dir
+    script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+    if [[ -d "$script_dir/lang" ]]; then
+        printf '%s\n' "$script_dir/lang"
+    else
+        printf '%s\n' "/usr/share/loopcatcher/lang"
+    fi
+}
+
+# t <message-id> [printf-args...] - looks up $effective_language's entry for
+# the id, falling back to English, then to the raw id itself (visibly broken
+# rather than silently empty - easy to grep for). Always ends with exactly
+# one trailing newline; every call site that composes a larger string wraps
+# it in "$(...)" anyway, which strips that back out, so this only actually
+# matters for the couple of call sites that print directly, uncaptured.
+t () {
+    local id="$1"; shift
+    local fmt=""
+    # Only two languages exist, so this stays a plain if instead of building
+    # a nameref indirection off $effective_language - which would also have
+    # to guard against it ever being something other than "en"/"es", since a
+    # nameref to a never-declared array silently falls back to treating
+    # [$id] as an arithmetic subscript instead of a string one, breaking on
+    # any dotted id. The same failure mode applies to MSG_es/MSG_en
+    # themselves if their file was never loaded (a corrupted/partial install
+    # missing lang/es.sh, say) - "[[ -v MSG_es ]]" doesn't reliably detect an
+    # associative array's existence in this bash version (only elements), so
+    # "declare -p ... &>/dev/null" is the check that's actually safe here.
+    # shellcheck disable=SC2154  # MSG_es/MSG_en are declared by lang/*.sh, sourced dynamically by load_lang_dir()
+    if [[ "$effective_language" == "es" ]] && declare -p MSG_es &>/dev/null; then
+        fmt="${MSG_es[$id]:-}"
+    fi
+    # shellcheck disable=SC2154  # MSG_en is declared by lang/en.sh, sourced dynamically by load_lang_dir()
+    if [[ -z "$fmt" ]] && declare -p MSG_en &>/dev/null; then
+        fmt="${MSG_en[$id]:-}"
+    fi
+    [[ -n "$fmt" ]] || fmt="$id"
+    if [[ $# -gt 0 ]]; then
+        # shellcheck disable=SC2059  # $fmt IS the format string by design - it's a catalog entry with %s placeholders, not user input
+        printf -- "$fmt\n" "$@"
+    else
+        printf '%s\n' "$fmt"
+    fi
+}
+
+# es* -> es, anything else -> en. Checked in the same priority glibc uses.
+detect_system_language () {
+    local loc="${LC_ALL:-${LC_MESSAGES:-${LANG:-en}}}"
+    case "$loc" in
+        es*) printf 'es' ;;
+        *)   printf 'en' ;;
+    esac
+}
+
+# Resolves the persisted "language" setting ("auto"/"en"/"es") into the
+# concrete "en"/"es" value t()/load_lang_dir() actually use. "auto" re-detects
+# from the system locale every time this runs, rather than once and freezing
+# the result into $effective_language forever - so picking "auto" after
+# having explicitly set a language, then Applying the change, genuinely goes
+# back to following the system locale, including a future locale change.
+resolve_language () {
+    if [[ "$language" == "auto" ]]; then
+        detect_system_language
+    else
+        printf '%s' "$language"
+    fi
+}
+
+# See the banner above: <dir>/en.sh always, <dir>/$effective_language.sh on
+# top if different and present. Safe to call more than once (e.g. once early
+# with the just-resolved language, again from load_config() once the
+# persisted value is known and re-resolved) - re-sourcing the same file just
+# re-populates the same array entries.
+load_lang_dir () {
+    local dir="$1"
+    # shellcheck disable=SC1090,SC1091
+    [[ -r "$dir/en.sh" ]] && source "$dir/en.sh"
+    if [[ "$effective_language" != "en" && -r "$dir/$effective_language.sh" ]]; then
+        # shellcheck disable=SC1090,SC1091
+        source "$dir/$effective_language.sh"
+    fi
+}
+
+# "auto"/"en"/"es" (persisted) and its "en"/"es" resolution (runtime-only,
+# never persisted - see resolve_language()). Defaulting to "auto" here (ahead
+# of Global State so load_lang_dir has a value to work with) means a fresh
+# install always starts by following the system locale, exactly like an
+# explicit "auto" choice does later - both are set once load_config() runs.
+language="auto"
+effective_language="$(resolve_language)"
+load_lang_dir "$(lang_root)"
 
 ###############################################################################
 # Global state
@@ -83,10 +207,11 @@ readonly WELCOME_MESSAGE="Welcome to LoopCatcher. It captures loopback audio fro
 # --- persisted to the config file ---
 # 0 = no log written at all, 1 = normal session log, 2 = adds encoder diagnostics.
 log_level="0"
-player_profile="spotify"
-sink_app_name="spotify"
-player_mpris_bus="$SPOTIFY_MPRIS_BUS"
-player_sink_match="$SPOTIFY_SINK_MATCH"
+# Directory name (under profiles/) of the active profile module.
+default_profile="spotify_native"
+# Space-separated module directory names allowed to be used anywhere.
+# default_profile's own module is always implicitly included.
+enabled_profiles=""
 nulloutput_name="loopcatcher"
 aac_profile="29"
 bitrate="48"
@@ -98,15 +223,23 @@ output_directory=""
 # written instead of cut. Trade-off: up to this much near-silence at the end of
 # the last track. 0 disables it.
 tail_drain_seconds="0.35"
-# Directory the session log is written to (see init_session_log). Empty means
-# the default: "${TMPDIR:-/tmp}/loopcatcher".
-log_directory=""
+# Absolute path of the session log file. Empty means the default:
+# "${TMPDIR:-/tmp}/loopcatcher/<session-name>.log" (see effective_log_file_path).
+log_file_path=""
+# "auto"/"en"/"es" - already set above (before Constants/i18n sourcing needed
+# it); repeated here only as a reminder of where it lives among the other
+# persisted keys. Overwritten by the config file's own value if it has one -
+# see resolve_language()/effective_language for what actually drives t().
 
 # --- CLI / lifecycle ---
 show_help=false
 show_version=false
 should_exit=0
 exit_note=""
+# Not persisted, session-only: true once any Settings/Profile Settings field
+# has actually been saved this run. Gates whether Welcome offers "Apply
+# configuration change" - see welcome_screen().
+config_changed=false
 
 # --- live status view ---
 status_dirty=0             # main loop repaints once per tick only when this is set
@@ -128,6 +261,21 @@ session_log_path=""
 # --- sink routing ---
 source_sink_index=""
 
+# --- generic, unprefixed runtime vars populated by the active profile
+# module's profile_activate() (see "Profile modules" below). Read by the
+# generic sink-detection/routing functions further down, and by whatever the
+# active module's own internal functions need them for.
+sink_app_name=""
+# shellcheck disable=SC2034  # read by the active profile module (e.g. spotify_native's MPRIS calls), not by this file
+player_mpris_bus=""
+player_sink_match=""
+
+# Every extra artist value a profile module's monitor collects for a track
+# (start_recording, generic, uses this for OGG's multi-ARTIST= tagging) -
+# declared here, not in the module, so start_recording never dereferences an
+# unset array under "set -u" when no module has populated it yet.
+artist_all=()
+
 # --- recording engine ---
 parec_pid=""
 encoder_pid=""
@@ -144,22 +292,6 @@ record_log_title=""
 record_log_tracknumber=""
 record_log_discnumber=""
 record_log_file=""
-
-# --- MPRIS monitor ---
-dbus_monitor_pid=""
-playbackstatus="Unknown"
-started_playing=false
-player_missing_polls=0    # consecutive liveness polls with the player bus gone
-active_recording_signature=""
-trackid=""
-last_trackid=""
-title=""
-artist=""       # first xesam:artist value - used for naming, log, AAC tag
-artist_all=()   # every xesam:artist value - used for the table and OGG tags
-album=""
-albumartist=""
-tracknumber=""
-discnumber=""
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 config_dir="$XDG_CONFIG_HOME/loopcatcher"
@@ -194,8 +326,8 @@ check_dependencies () {
     )
     for req in "${requirements[@]}"; do
         command -v "$req" >/dev/null 2>&1 && continue
-        printf 'FATAL: required command "%s" was not found in PATH.\n' "$req" >&2
-        [[ "$req" == "gum" ]] && printf 'Install it with: sudo apt install gum   (Debian 13+; older releases: repo.charm.sh)\n' >&2
+        printf 'FATAL: %s\n' "$(t dep.missing_command "$req")" >&2
+        [[ "$req" == "gum" ]] && printf '%s\n' "$(t dep.gum_install_hint)" >&2
         exit 1
     done
 }
@@ -208,7 +340,7 @@ check_encoder_dependency () {
         *) return ;;
     esac
     if ! command -v "$tool" >/dev/null 2>&1; then
-        printf 'FATAL: "%s" is required for record_format=%s but was not found\n' "$tool" "$record_format" >&2
+        printf 'FATAL: %s\n' "$(t dep.missing_encoder "$tool" "$record_format")" >&2
         exit 1
     fi
 }
@@ -217,10 +349,11 @@ check_encoder_dependency () {
 # ELEMENT TYPES
 #
 # Every visual element on screen is produced by exactly one of the functions
-# below (or, for the Spinner, one of the two literal "gum spin" calls noted
-# below). To change how an element type LOOKS, edit only its gum flags here -
-# every screen that uses it picks up the change automatically. Nothing else in
-# the script should call "gum style" directly for a boxed/bordered element.
+# below (or, for the Spinner, one of the "gum spin" calls noted below). To
+# change how an element type LOOKS, edit only its gum flags here - every
+# screen that uses it picks up the change automatically. Nothing else in the
+# script should call "gum style"/"gum table"/"gum pager"/"gum filter" directly
+# for a boxed/bordered/full-screen element.
 #
 #   Title Bar     -> ui_title ()        top banner, alone (Finish screen only)
 #   Title row     -> ui_title_row ()    Title Bar + Cancel hint joined side by
@@ -232,8 +365,9 @@ check_encoder_dependency () {
 #                                        (it sits beside the Title Bar, not in
 #                                        it - see ui_title_row)
 #   Spinner       -> real "gum spin" calls in wizard_step_screen() (Recording
-#                    Wizard steps) and recording_screen_render() (Recording
-#                    screen) - the --spinner flag picks the animation there
+#                    Wizard steps) and profiles/*/profile.sh's
+#                    recording_screen_render() - the --spinner flag picks the
+#                    animation there
 #   Table         -> ui_kv_table ()     "Field / Value" rows, a real "gum
 #                                        table" (rounded border) - the
 #                                        standard way this app shows any list
@@ -241,21 +375,27 @@ check_encoder_dependency () {
 #                                        status, Welcome's config summary).
 #                                        Always a standalone sibling element,
 #                                        never nested inside a Normal box.
+#   Pager         -> ui_pager ()        a real "gum pager" invocation - full-
+#                                        screen scrollable text, used only for
+#                                        About Profile's README content
 #   Gap           -> ui_gap ()          one blank line, printed right before
 #                                        every interactive widget ("gum
-#                                        choose"/"gum input"/"gum spin") so it
-#                                        never sits flush against the element
-#                                        above it
+#                                        choose"/"gum input"/"gum filter"/
+#                                        "gum spin") so it never sits flush
+#                                        against the element above it
 #
 # ui_subtitle (bold, centred heading - nested inside a Normal element, e.g. a
 # Wizard step, or standalone above a Table, e.g. Welcome) and the shared table
 # column widths (UI_TABLE_LABEL_WIDTH / UI_TABLE_VALUE_WIDTH, above) live here
-# too.
+# too. "gum filter" (Change Profile, see the Welcome/Profile screens further
+# down) is this app's only other interactive selection widget besides "gum
+# choose" - used there, and only there, because the profile list is meant to
+# be searched, not just picked from a short fixed menu.
 ###############################################################################
 
 require_tty () {
     if [[ ! -t 0 || ! -t 1 ]]; then
-        printf 'FATAL: %s requires an interactive terminal.\n' "${1:-this step}" >&2
+        printf 'FATAL: %s\n' "$(t err.requires_tty "${1:-this step}")" >&2
         exit 4
     fi
 }
@@ -295,7 +435,7 @@ ui_notify () {
 # Cancel pseudo-element: bold, right-aligned in its own column, never inside a
 # bordered element. Only ever composed into ui_title_row.
 ui_cancel_hint () {
-    gum style --width "$UI_HINT_WIDTH" --margin "0 0" --padding "1 1" --border thick --bold --align center --foreground="#D5A021" --border-foreground="#D5A021" -- 'Press Ctrl+C to cancel and exit.'
+    gum style --width "$UI_HINT_WIDTH" --margin "0 0" --padding "1 1" --border thick --bold --align center --foreground="#D5A021" --border-foreground="#D5A021" -- "$(t ui.cancel_hint)"
 }
 
 # Gap element: one blank line, printed right before every interactive widget
@@ -343,6 +483,13 @@ ui_kv_table () {
         --separator "$(printf '\t')" --columns "$col1,$col2"
 }
 
+# Pager element: a real "gum pager" invocation - full-screen scrollable text
+# viewer. $1 is a file path (its content is shown verbatim). Used only for
+# About Profile's README content, which can be arbitrarily long.
+ui_pager () {
+    gum pager < "$1"
+}
+
 # Shorten a long value (paths) so a table row does not wrap.
 clip_text () {
     local s="$1" max="${2:-65}"
@@ -382,7 +529,7 @@ render_page_plain () {
 }
 
 _cancel_and_exit () {
-    printf 'Cancelled.\n' >&2
+    printf '%s\n' "$(t ui.cancelled)" >&2
     exit 0
 }
 
@@ -404,27 +551,34 @@ paint_frame () {
 ###############################################################################
 # Session log / debugging
 #
-# One log per session, written under log_directory (configurable; defaults to
-# the OS temp directory), recording every captured item (the same metadata the
-# Recording screen shows, plus how long the capture took). Governed entirely
-# by log_level: 0 no log is written (not even the file), 1 the log above, 2
-# also adds encoder (fdkaac / oggenc) diagnostics - debugging is intentionally
-# limited to those two tools.
+# One log per session, written to log_file_path (configurable; defaults to
+# "${TMPDIR:-/tmp}/loopcatcher/<session-name>.log"), recording every captured
+# item (the same metadata the Recording screen shows, plus how long the
+# capture took). Governed entirely by log_level: 0 no log is written (not even
+# the file), 1 the log above, 2 also adds encoder (fdkaac / oggenc)
+# diagnostics - debugging is intentionally limited to those two tools.
+#
+# Deliberately NOT translated: entries are structured/parseable (grep-able
+# key="value" pairs) and meant to stay consistent across a language change,
+# not prose read by a user - unlike everything else in this file.
 ###############################################################################
 
-# The directory session logs are written to: log_directory if the user set
-# one, else the default. Shared by init_session_log and the Configuration
-# screen (so the Paths group can show the effective value, not just "").
-effective_log_directory () {
-    printf '%s' "${log_directory:-${TMPDIR:-/tmp}/loopcatcher}"
+# The absolute path session logs are written to: log_file_path if the user
+# set one, else the default. Shared by init_session_log and the Configuration
+# screen (so the Paths group can show the effective value even before a
+# session name is known, using a "<session>" placeholder).
+effective_log_file_path () {
+    if [[ -n "$log_file_path" ]]; then
+        printf '%s' "$log_file_path"
+    else
+        printf '%s/%s.log' "${TMPDIR:-/tmp}/loopcatcher" "${session_name:-<session>}"
+    fi
 }
 
 init_session_log () {
     [[ "$log_level" -ge 1 ]] || return 0
-    local dir
-    dir="$(effective_log_directory)"
-    mkdir -p -- "$dir" 2>/dev/null
-    session_log_path="$dir/$session_name.log"
+    session_log_path="$(effective_log_file_path)"
+    mkdir -p -- "$(dirname "$session_log_path")" 2>/dev/null
 }
 
 log_line () {
@@ -450,91 +604,153 @@ log_debug () {
 
 ensure_config_dir () {
     if ! mkdir -p -- "$config_dir"; then
-        printf 'FATAL: cannot create config directory: %s\n' "$config_dir" >&2
+        printf 'FATAL: %s\n' "$(t err.cannot_create_config_dir "$config_dir")" >&2
         exit 1
     fi
 }
 
+# Fixed, generic keys every config file has, independent of which profile
+# module is active. Shared by save_config (what it always writes) and
+# load_config (nothing special needed there - a bare "source" picks them up).
+_fixed_config_keys () {
+    printf '%s\n' log_level default_profile enabled_profiles nulloutput_name \
+        aac_profile bitrate record_format filename_scheme output_directory \
+        tail_drain_seconds log_file_path language
+}
+
+# The active profile module's own persisted config keys (see
+# profile_config_schema() in the "Profile modules" section below).
+_profile_schema_keys () {
+    declare -F profile_config_schema >/dev/null 2>&1 || return 0
+    profile_config_schema | cut -f1
+}
+
+# Reads the whole config file once, at process startup (see main()/
+# _internal_wait, the only two callers, each running it exactly once). Every
+# Settings/Profile Settings edit after that still validates and saves to disk
+# immediately, but never calls this again - see "Settings edits" below and
+# apply_config_changes().
 load_config () {
     if [[ -r "$config_path" ]]; then
         # shellcheck disable=SC1090
         source "$config_path"
     fi
 
-    case "${player_profile:-}" in
-        custom)
-            # Trust the file; fill any missing detection field with Spotify's.
-            [[ -n "${sink_app_name:-}" ]]     || sink_app_name="spotify"
-            [[ -n "${player_mpris_bus:-}" ]]  || player_mpris_bus="$SPOTIFY_MPRIS_BUS"
-            [[ -n "${player_sink_match:-}" ]] || player_sink_match="$SPOTIFY_SINK_MATCH"
-            ;;
-        *)
-            # spotify / empty / unknown: (re)apply the Spotify profile.
-            player_profile_apply spotify
-            ;;
+    # $language may have just changed from the top-of-file "auto" default to
+    # whatever the config file persisted - re-resolve it (still "auto" re-
+    # detects live, an explicit "en"/"es" is used as-is) and (re)load its
+    # catalog file on top of the English baseline now that the real value is
+    # known.
+    effective_language="$(resolve_language)"
+    load_lang_dir "$(lang_root)"
+
+    if [[ -z "${default_profile:-}" ]] || ! _profile_available "$default_profile"; then
+        default_profile="spotify_native"
+    fi
+    if [[ -z "${enabled_profiles:-}" ]]; then
+        enabled_profiles="$default_profile"
+    fi
+    # default_profile's own module is always implicitly enabled, even if it
+    # was left out of - or removed from - the persisted list.
+    case " $enabled_profiles " in
+        *" $default_profile "*) ;;
+        *) enabled_profiles="$enabled_profiles $default_profile" ;;
     esac
+
+    load_profile_module "$default_profile" || return 1
+
+    # If none of the active module's schema-declared keys were already set by
+    # the sourced file, this is its first use - seed it from the module's
+    # own defaults and persist immediately, so the file gains that module's
+    # full prefixed section (see profile_config_schema/profile_apply_defaults).
+    local needs_seed=0 key
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        [[ -v "$key" ]] || { needs_seed=1; break; }
+    done < <(_profile_schema_keys)
+
+    if [[ $needs_seed -eq 1 ]]; then
+        profile_apply_defaults
+        save_config
+    else
+        profile_activate
+    fi
 }
 
 save_config () {
-    local tmp
+    local tmp known_keys foreign_lines="" k
+    local -a fixed_keys=()
+    while IFS= read -r k; do fixed_keys+=("$k"); done < <(_fixed_config_keys)
+
+    # Foreign lines: keys from the OLD file that belong to neither the fixed
+    # generic set nor the currently active module - i.e. another module's
+    # previously-persisted settings. Preserved verbatim so switching
+    # default_profile away and back never silently drops them (we never
+    # source an inactive module just to learn its own key list).
+    if [[ -r "$config_path" ]]; then
+        known_keys="$(IFS='|'; printf '%s' "${fixed_keys[*]}")"
+        while IFS= read -r k; do
+            [[ -n "$k" ]] && known_keys="$known_keys|$k"
+        done < <(_profile_schema_keys)
+        foreign_lines="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*="' "$config_path" | grep -Ev "^($known_keys)=")"
+    fi
+
     tmp="$(mktemp -- "$config_path.XXXXXX")" || {
-        printf 'WARN: could not write config (mktemp failed in %s)\n' "$config_dir" >&2
+        printf 'WARN: %s\n' "$(t warn.config_mktemp_failed "$config_dir")" >&2
         return 1
     }
-    cat > "$tmp" <<EOF
-# loopcatcher config - edited at runtime via the Configuration screen.
-log_level="$log_level"
-player_profile="$player_profile"
-sink_app_name="$sink_app_name"
-player_mpris_bus="$player_mpris_bus"
-player_sink_match="$player_sink_match"
-nulloutput_name="$nulloutput_name"
-aac_profile="$aac_profile"
-bitrate="$bitrate"
-record_format="$record_format"
-filename_scheme="$filename_scheme"
-output_directory="$output_directory"
-tail_drain_seconds="$tail_drain_seconds"
-log_directory="$log_directory"
-EOF
+
+    {
+        printf '# loopcatcher config - edited at runtime via the Configuration screen.\n'
+        for k in "${fixed_keys[@]}"; do
+            printf '%s="%s"\n' "$k" "${!k}"
+        done
+        while IFS= read -r k; do
+            [[ -n "$k" ]] || continue
+            printf '%s="%s"\n' "$k" "${!k}"
+        done < <(_profile_schema_keys)
+        [[ -n "$foreign_lines" ]] && printf '%s\n' "$foreign_lines"
+    } > "$tmp"
+
     # Atomic replace: a crash mid-write never leaves a truncated config.
     mv -f -- "$tmp" "$config_path" || { rm -f -- "$tmp"; return 1; }
 }
 
 # Prints the first problem it finds and returns 1; returns 0 when all valid.
 # validate_settings is the hard (exit 1) startup wrapper; validate_settings_soft
-# is used from the Configuration screen so a bad value cannot kill a run.
+# is used from the Configuration screen so a bad value cannot kill a run. Each
+# t() call here is deliberately NOT wrapped in "$(...)" - both callers either
+# capture the whole function's stdout themselves (command substitution there
+# strips the trailing newline t() adds either way) or, for the hard-exit path,
+# print directly to the terminal, where that trailing newline is wanted.
 _validate_settings () {
     case "$record_format" in
         aac|ogg) ;;
-        *) printf 'Invalid record_format: %s (allowed: aac, ogg)\n' "$record_format"; return 1 ;;
+        *) t err.invalid_record_format "$record_format"; return 1 ;;
     esac
     case "$filename_scheme" in
         normal|strict|strict-lc-nodir) ;;
-        *) printf 'Invalid filename_scheme: %s (allowed: normal, strict, strict-lc-nodir)\n' "$filename_scheme"; return 1 ;;
+        *) t err.invalid_filename_scheme "$filename_scheme"; return 1 ;;
     esac
-    case "$player_profile" in
-        spotify|custom) ;;
-        *) printf 'Invalid player_profile: %s (allowed: spotify, custom)\n' "$player_profile"; return 1 ;;
-    esac
-    if [[ ! "$player_mpris_bus" =~ ^org\.mpris\.MediaPlayer2\.[A-Za-z0-9._-]+$ ]]; then
-        printf 'Invalid player_mpris_bus: %s\n' "$player_mpris_bus"; return 1
-    fi
-    if [[ -z "$player_sink_match" ]]; then
-        printf 'player_sink_match must not be empty\n'; return 1
+    if ! _profile_available "$default_profile"; then
+        t err.invalid_default_profile "$default_profile"; return 1
     fi
     if [[ ! "$bitrate" =~ ^[0-9]+$ ]] || [[ "$bitrate" -le 0 ]]; then
-        printf 'Invalid bitrate: %s (must be a positive integer)\n' "$bitrate"; return 1
+        t err.invalid_bitrate "$bitrate"; return 1
     fi
     if [[ ! "$aac_profile" =~ ^[0-9]+$ ]] || [[ "$aac_profile" -le 0 ]]; then
-        printf 'Invalid aac_profile: %s (must be a positive integer)\n' "$aac_profile"; return 1
+        t err.invalid_aac_profile "$aac_profile"; return 1
     fi
     if [[ ! "$tail_drain_seconds" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        printf 'Invalid tail_drain_seconds: %s (must be a non-negative number, e.g. 0.35)\n' "$tail_drain_seconds"; return 1
+        t err.invalid_tail_drain_seconds "$tail_drain_seconds"; return 1
     fi
     case "$log_level" in
         0|1|2) ;;
-        *) printf 'Invalid log_level: %s (allowed: 0, 1, 2)\n' "$log_level"; return 1 ;;
+        *) t err.invalid_log_level "$log_level"; return 1 ;;
+    esac
+    case "$language" in
+        auto|en|es) ;;
+        *) t err.invalid_language "$language"; return 1 ;;
     esac
     return 0
 }
@@ -548,78 +764,77 @@ validate_settings_soft () {
 }
 
 ###############################################################################
-# Player profiles
+# Profile modules
+#
+# A profile module is a directory under profiles/ (dev checkout) or
+# /usr/share/loopcatcher/profiles/ (installed package - mirrors the same
+# dual-path lookup get_script_version() already uses for VERSION) containing
+# a profile.sh that gets `source`d directly into this process. Only one
+# module is ever active at a time, so its functions/state share this script's
+# global namespace - no per-module prefixing needed for functions, only for
+# persisted config keys (see profile_config_schema in each module).
+#
+# Every profile.sh must define: profile_label, profile_config_schema,
+# profile_apply_defaults, profile_activate, profile_wait_condition,
+# profile_run, profile_cleanup. See profiles/spotify_native/profile.sh for a
+# fully worked example and AGENTS.md for the full contract. A module may also
+# ship its own lang/ directory (one file per language, pure MSG_en/MSG_es
+# data - its friendly label and its Profile Settings field labels), sourced
+# alongside profile.sh below.
 ###############################################################################
 
-player_profile_label () {
-    case "${1:-}" in
-        spotify) printf 'Spotify' ;;
-        custom)  printf 'Custom Player' ;;
-        *)       printf '%s' "${1:-your player}" ;;
-    esac
-}
-
-# spotify -> overwrite the three detection fields with Spotify's values.
-# custom  -> just mark the profile; the caller edits the fields.
-player_profile_apply () {
-    case "${1:-}" in
-        spotify)
-            player_profile="spotify"
-            sink_app_name="spotify"
-            player_mpris_bus="$SPOTIFY_MPRIS_BUS"
-            player_sink_match="$SPOTIFY_SINK_MATCH"
-            ;;
-        custom)
-            player_profile="custom"
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-# One-shot PlaybackStatus query (used by the wizard before the coproc exists).
-player_playback_status () {
-    dbus-send --print-reply --dest="$player_mpris_bus" /org/mpris/MediaPlayer2 \
-        org.freedesktop.DBus.Properties.Get \
-        string:org.mpris.MediaPlayer2.Player string:PlaybackStatus 2>/dev/null \
-      | awk -F'"' '/string "(Playing|Paused|Stopped)"/{print $2; exit}'
-}
-
-_playback_is_playing () {
-    [[ "$(player_playback_status)" == "Playing" ]]
-}
-
-_playback_is_stopped () {
-    [[ "$(player_playback_status)" != "Playing" ]]
-}
-
-# True while the player's MPRIS name still has an owner on the bus. Closing the
-# player releases the name but emits no PropertiesChanged, so poll_player_liveness
-# checks this to end a session whose player quit outright. An empty bus name (a
-# half-configured custom profile) counts as alive so we never self-terminate.
-player_bus_has_owner () {
-    [[ -n "$player_mpris_bus" ]] || return 0
-    dbus-send --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
-        org.freedesktop.DBus.GetNameOwner "string:$player_mpris_bus" >/dev/null 2>&1
-}
-
-# Called by the main loop on a timer once playback has begun. A plain quit of
-# the player sends no Paused/Stopped signal and dbus-monitor keeps running,
-# which would leave us recording silence forever; two consecutive misses
-# (~a few seconds) end the session the same way a pause does.
-poll_player_liveness () {
-    [[ "$started_playing" == "true" && $should_exit -eq 0 ]] || return 0
-    if player_bus_has_owner; then
-        player_missing_polls=0
-        return 0
+profiles_root () {
+    local script_dir
+    script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+    if [[ -d "$script_dir/profiles" ]]; then
+        printf '%s\n' "$script_dir/profiles"
+    else
+        printf '%s\n' "/usr/share/loopcatcher/profiles"
     fi
-    player_missing_polls=$((player_missing_polls + 1))
-    [[ $player_missing_polls -ge 2 ]] || return 0
-    stop_current_recording "drain"
-    active_recording_signature=""
-    log_line "player exited"
-    end_session
+}
+
+# Every discovered module directory name (has a profiles/<name>/profile.sh),
+# sorted. Used by Change Profile and the Enabled Profiles settings screen.
+list_profile_modules () {
+    local dir name root
+    root="$(profiles_root)"
+    [[ -d "$root" ]] || return 0
+    for dir in "$root"/*/; do
+        [[ -d "$dir" ]] || continue
+        name="$(basename "$dir")"
+        [[ -f "$dir/profile.sh" ]] && printf '%s\n' "$name"
+    done | sort
+}
+
+# True when $1 names a module that both exists on disk and is listed in
+# enabled_profiles.
+_profile_available () {
+    local name="$1" m
+    [[ -n "$name" ]] || return 1
+    [[ -f "$(profiles_root)/$name/profile.sh" ]] || return 1
+    for m in ${enabled_profiles:-}; do
+        [[ "$m" == "$name" ]] && return 0
+    done
+    return 1
+}
+
+# Sources profiles/<name>/lang/ (if present - one file per language, same
+# convention as lang_root(), see load_lang_dir() above) and
+# profiles/<name>/profile.sh into this process. load_config() is the only
+# caller, and it only ever runs once per process (see main()/_internal_wait)
+# - so this never needs to guard against loading a second, different module
+# mid-session.
+load_profile_module () {
+    local name="$1" path lang_dir
+    path="$(profiles_root)/$name/profile.sh"
+    if [[ ! -r "$path" ]]; then
+        printf 'FATAL: %s\n' "$(t err.profile_module_not_found "$name" "$path")" >&2
+        return 1
+    fi
+    lang_dir="$(profiles_root)/$name/lang"
+    [[ -d "$lang_dir" ]] && load_lang_dir "$lang_dir"
+    # shellcheck disable=SC1090
+    source "$path"
 }
 
 ###############################################################################
@@ -651,11 +866,11 @@ default_music_dir () {
 initialize_output_directory () {
     [[ -n "$output_directory" ]] || output_directory="$(default_music_dir)"
     if [[ -z "$output_directory" ]]; then
-        printf 'FATAL: could not determine an output directory (HOME is unset).\n' >&2
+        printf 'FATAL: %s\n' "$(t err.no_output_directory)" >&2
         exit 1
     fi
     if ! mkdir -p -- "$output_directory"; then
-        printf 'FATAL: cannot create output directory: %s\n' "$output_directory" >&2
+        printf 'FATAL: %s\n' "$(t err.cannot_create_output_directory "$output_directory")" >&2
         exit 1
     fi
 }
@@ -667,9 +882,9 @@ default_session_name () {
 # Reject a name that cannot be one safe path component. Prints the reason.
 validate_session_name () {
     case "${1:-}" in
-        "")       printf 'Session name cannot be empty' ;;
-        . | ..)   printf "Session name cannot be '.' or '..'" ;;
-        */*)      printf "Session name cannot contain '/'" ;;
+        "")       t err.session_name_empty ;;
+        . | ..)   t err.session_name_dots ;;
+        */*)      t err.session_name_slash ;;
         *)        return 0 ;;
     esac
     return 1
@@ -686,57 +901,186 @@ dir_not_empty () {
 }
 
 ###############################################################################
-# Welcome screen
+# Welcome screen (main menu)
 ###############################################################################
 
 welcome_screen () {
-    local choice outdir
+    local choice i
 
     while true; do
-        if [[ ! -f "$config_path" ]]; then
-            outdir="${output_directory:-$(default_music_dir)}"
-            render_page "Welcome" \
-                "$(ui_box "$WELCOME_MESSAGE")" \
-                "$(ui_subtitle 'Default Configuration' "$UI_WIDTH")" \
-                "$(ui_kv_table 'Field' 'Value' \
-                    'Codec' "$record_format" \
-                    'AAC Profile' "$aac_profile" \
-                    'Bitrate' "${bitrate} kbps" \
-                    'Player Profile' "$(player_profile_label "$player_profile")" \
-                    'Output Directory' "$(clip_text "$outdir")")"
-            ui_gap
-            choice="$(gum choose --header "Do you want to accept the default configuration?" \
-                --cursor="$UI_CURSOR" --selected "Accept configuration" -- "Accept configuration" "Change configuration")" \
-                || _cancel_and_exit
-            case "$choice" in
-                "Accept configuration")
-                    output_directory="$outdir"
-                    save_config
-                    load_config
-                    return
-                    ;;
-                "Change configuration") config_screen ;;
-            esac
-        else
-            load_config
-            render_page "Welcome" \
-                "$(ui_subtitle 'Saved Configuration' "$UI_WIDTH")" \
-                "$(ui_kv_table 'Field' 'Value' \
-                    'Codec' "$record_format" \
-                    'AAC Profile' "$aac_profile" \
-                    'Bitrate' "${bitrate} kbps" \
-                    'Player Profile' "$(player_profile_label "$player_profile")" \
-                    'Output Directory' "$(clip_text "${output_directory:-$(default_music_dir)}")")"
-            ui_gap
-            choice="$(gum choose --header "Continue with this configuration?" \
-                --cursor="$UI_CURSOR" --selected "Continue" -- "Continue" "Change configuration")" \
-                || _cancel_and_exit
-            case "$choice" in
-                Continue) return ;;
-                "Change configuration") config_screen ;;
-            esac
+        local -a ids=(continue profile settings)
+        local -a items=("$(t welcome.menu.continue)" "$(t welcome.menu.profile)" "$(t welcome.menu.settings)")
+        # "Apply configuration change" only appears once there's actually a
+        # saved-but-not-yet-applied change to apply (config_changed, set by
+        # _cfg_edit_input/_cfg_edit_choice/change_profile_screen/the two
+        # inline saves in config_group_paths and config_group_enabled_profiles
+        # - every user-initiated save site, deliberately not save_config()
+        # itself, since that would also fire on load_config()'s automatic
+        # first-run module seeding).
+        if [[ "$config_changed" == "true" ]]; then
+            ids+=(apply)
+            items+=("$(t welcome.menu.apply_changes)")
         fi
+        ids+=(about exit)
+        items+=("$(t welcome.menu.about)" "$(t welcome.menu.exit)")
+
+        render_page "$(t welcome.title)" \
+            "$(ui_box "$(t welcome.message)")" \
+            "$(ui_subtitle "$(t welcome.config_heading)" "$UI_WIDTH")" \
+            "$(ui_kv_table "$(t common.table.field)" "$(t common.table.value)" \
+                "$(t welcome.field.codec)" "$record_format" \
+                "$(t welcome.field.aac_profile)" "$aac_profile" \
+                "$(t welcome.field.bitrate)" "${bitrate} kbps" \
+                "$(t welcome.field.player_profile)" "$default_profile" \
+                "$(t welcome.field.output_directory)" "$(clip_text "$output_directory")")"
+        ui_gap
+        choice="$(gum choose --header "$(t welcome.menu.header)" --cursor="$UI_CURSOR" --selected "${items[0]}" -- "${items[@]}")" || _cancel_and_exit
+        for i in "${!items[@]}"; do
+            [[ "$choice" == "${items[$i]}" ]] || continue
+            case "${ids[$i]}" in
+                continue) return ;;
+                profile)  profile_menu ;;
+                settings) config_screen ;;
+                apply)    apply_config_changes ;;
+                about)    about_screen ;;
+                exit)     _cancel_and_exit ;;
+            esac
+            break
+        done
     done
+}
+
+# "exec" replaces this process outright (same technique the Recording
+# Wizard's own "$0 --internal-wait ..." re-exec already relies on) - a true,
+# immediate restart straight back into a freshly-sourced script and a fresh
+# load_config(), picking up whatever Settings/Profile Settings edits were
+# saved to disk during this run (see "Settings edits" - nothing reloads
+# mid-session, this is the only way to apply them without relaunching by hand).
+apply_config_changes () {
+    exec "$0"
+}
+
+profile_menu () {
+    local choice i
+    local -a ids=(change settings about back)
+    while true; do
+        local -a items=(
+            "$(t profile.menu.change)"
+            "$(t profile.menu.settings)"
+            "$(t profile.menu.about)"
+            "$(t common.back)"
+        )
+        render_page "$(t profile.title)"
+        ui_gap
+        choice="$(gum choose --header "$(t profile.menu.header "$default_profile")" --cursor="$UI_CURSOR" -- "${items[@]}")" || return
+        for i in "${!items[@]}"; do
+            [[ "$choice" == "${items[$i]}" ]] || continue
+            case "${ids[$i]}" in
+                change)   change_profile_screen ;;
+                settings) profile_settings_screen ;;
+                about)    about_profile_screen ;;
+                back)     return ;;
+            esac
+            break
+        done
+    done
+}
+
+# Just another field edit now (see "Settings edits"): saves default_profile
+# and returns to profile_menu - it takes "Apply configuration change" from
+# the Welcome menu to actually load the newly-chosen module.
+change_profile_screen () {
+    local -a available=()
+    local m choice
+    for m in $(list_profile_modules); do
+        case " $enabled_profiles " in
+            *" $m "*) available+=("$m") ;;
+        esac
+    done
+    [[ ${#available[@]} -eq 0 ]] && available=("$default_profile")
+
+    render_page "$(t profile.title)"
+    ui_gap
+    choice="$(gum filter --header "$(t profile.change.header)" --prompt="$UI_CURSOR" -- "${available[@]}")" || return
+    [[ -n "$choice" && "$choice" != "$default_profile" ]] || return
+
+    default_profile="$choice"
+    save_config
+    config_changed=true
+}
+
+# Reads the active module's profile_config_schema() into parallel arrays so
+# the caller can build a menu and dispatch input/choice editors generically -
+# the same way the Configuration screen's own groups do below.
+_profile_schema_rows () {
+    schema_keys=(); schema_labels=(); schema_kinds=(); schema_choices=()
+    local key label default kind choices
+    # shellcheck disable=SC2034  # "default" is positional-only here - profile_apply_defaults() is what actually applies it
+    while IFS=$'\t' read -r key label default kind choices; do
+        [[ -n "$key" ]] || continue
+        schema_keys+=("$key")
+        schema_labels+=("$label")
+        schema_kinds+=("$kind")
+        schema_choices+=("$choices")
+    done < <(profile_config_schema)
+}
+
+profile_settings_screen () {
+    local choice i key back_label
+    while true; do
+        _profile_schema_rows
+        back_label="$(t common.back)"
+        local -a menu_items=()
+        for i in "${!schema_keys[@]}"; do
+            key="${schema_keys[$i]}"
+            menu_items+=("${schema_labels[$i]}:  ${!key}")
+        done
+        menu_items+=("$back_label")
+
+        render_page "$(t config.title)"
+        ui_gap
+        choice="$(gum choose --header "$(t profile.settings.header "$(profile_label)")" --cursor="$UI_CURSOR" -- "${menu_items[@]}")" || return
+        [[ "$choice" != "$back_label" ]] || return
+
+        for i in "${!schema_keys[@]}"; do
+            [[ "$choice" == "${menu_items[$i]}" ]] || continue
+            if [[ "${schema_kinds[$i]}" == "choice" ]]; then
+                # shellcheck disable=SC2086
+                _cfg_edit_choice "${schema_keys[$i]}" "${schema_labels[$i]}" ${schema_choices[$i]}
+            else
+                _cfg_edit_input "${schema_keys[$i]}" "${schema_labels[$i]}"
+            fi
+            break
+        done
+    done
+}
+
+about_profile_screen () {
+    local readme
+    readme="$(profiles_root)/$default_profile/README.md"
+    render_page "$(t profile.title)"
+    if [[ -r "$readme" ]]; then
+        ui_pager "$readme"
+    else
+        printf '%s\n' "$(ui_notify "$(t profile.about.no_readme)")"
+        ui_gap
+        printf '%s\n' "$(gum style --bold -- "$(t common.press_any_key_continue)")"
+        read -rsn1 || true
+    fi
+}
+
+about_screen () {
+    render_page "$(t about.title)" \
+        "$(ui_box \
+            "$(t about.app_line "$SCRIPT_VERSION")" \
+            "" \
+            "$(t about.description)" \
+            "" \
+            "$(t about.license)" \
+            "$(t about.homepage)")"
+    ui_gap
+    printf '%s\n' "$(gum style --bold -- "$(t common.press_any_key_continue)")"
+    read -rsn1 || true
 }
 
 ###############################################################################
@@ -746,35 +1090,18 @@ welcome_screen () {
 session_name_screen () {
     local suggested prefill="" err="" value candidate
 
-    # CLI --session fast path: validate, never prompt.
-    if [[ -n "${session_name:-}" ]]; then
-        if ! err="$(validate_session_name "$session_name")"; then
-            printf 'FATAL: %s (from --session).\n' "$err" >&2
-            exit 1
-        fi
-        candidate="$output_directory/$session_name"
-        if dir_not_empty "$candidate"; then
-            printf 'FATAL: session folder from --session exists and is not empty: %s\n' "$candidate" >&2
-            exit 1
-        fi
-        session_output_directory="$candidate"
-        mkdir -p -- "$session_output_directory" \
-            || { printf 'FATAL: cannot create session folder: %s\n' "$candidate" >&2; exit 1; }
-        return
-    fi
-
     suggested="$(default_session_name)"
 
     while true; do
-        render_page "Session Name" \
+        render_page "$(t session.title)" \
             "$(ui_box \
-                "This is the session name. It is used to generate the destination folder for what will be recorded, so existing files are not accidentally overwritten." \
+                "$(t session.intro)" \
                 "" \
-                "$(gum style --bold -- 'Enter a UNIQUE session name that has not been used before.')")"
+                "$(gum style --bold -- "$(t session.instruction)")")"
         [[ -n "$err" ]] && printf '%s\n' "$(ui_notify "$err")"
         ui_gap
 
-        if ! value="$(gum input --header "Session name (Enter for the suggested name, Esc to cancel)" \
+        if ! value="$(gum input --header "$(t session.input_header)" \
                 --prompt="$UI_CURSOR" --placeholder "$suggested" --value "$prefill")"; then
             _cancel_and_exit
         fi
@@ -785,7 +1112,7 @@ session_name_screen () {
         fi
         candidate="$output_directory/$value"
         if dir_not_empty "$candidate"; then
-            err="Session folder exists and is not empty: $candidate"
+            err="$(t session.error.folder_not_empty "$candidate")"
             prefill="$value"; continue
         fi
         break
@@ -794,7 +1121,7 @@ session_name_screen () {
     session_name="$value"
     session_output_directory="$candidate"
     mkdir -p -- "$session_output_directory" \
-        || { printf 'FATAL: cannot create session folder: %s\n' "$candidate" >&2; exit 1; }
+        || { printf 'FATAL: %s\n' "$(t err.cannot_create_session_folder "$candidate")" >&2; exit 1; }
 }
 
 ###############################################################################
@@ -802,36 +1129,20 @@ session_name_screen () {
 ###############################################################################
 
 # Edit one variable with gum input, validating and auto-saving on success.
+# Never reloads (see "Settings edits" at the top of this file) - the edited
+# global was already mutated directly below, so the current screen's own next
+# redraw already reflects it.
 _cfg_edit_input () {
     local var="$1" header="$2" new err=""
     while true; do
-        render_page "Configuration"
+        render_page "$(t config.title)"
         [[ -n "$err" ]] && printf '%s\n' "$(ui_notify "$err")"
         ui_gap
         new="$(gum input --header "$header" --prompt="$UI_CURSOR" --value "${!var}")" || return 0
         printf -v "$var" '%s' "$new"
         if err="$(validate_settings_soft 2>&1)"; then
             save_config
-            load_config
-            return 0
-        fi
-    done
-}
-
-# Same, editing a player detection field: forces player_profile=custom BEFORE
-# saving, so load_config does not immediately revert the edit back to Spotify.
-_cfg_edit_detection_input () {
-    local var="$1" header="$2" new err=""
-    while true; do
-        render_page "Configuration"
-        [[ -n "$err" ]] && printf '%s\n' "$(ui_notify "$err")"
-        ui_gap
-        new="$(gum input --header "$header" --prompt="$UI_CURSOR" --value "${!var}")" || return 0
-        printf -v "$var" '%s' "$new"
-        player_profile="custom"
-        if err="$(validate_settings_soft 2>&1)"; then
-            save_config
-            load_config
+            config_changed=true
             return 0
         fi
     done
@@ -841,182 +1152,210 @@ _cfg_edit_choice () {
     local var="$1" header="$2"; shift 2
     local new err=""
     while true; do
-        render_page "Configuration"
+        render_page "$(t config.title)"
         [[ -n "$err" ]] && printf '%s\n' "$(ui_notify "$err")"
         ui_gap
         new="$(gum choose --header "$header" --cursor="$UI_CURSOR" --selected "${!var}" -- "$@")" || return 0
         printf -v "$var" '%s' "$new"
         if err="$(validate_settings_soft 2>&1)"; then
             save_config
-            load_config
+            config_changed=true
             return 0
         fi
     done
 }
 
 config_group_codecs () {
-    local choice
+    local choice i
+    local -a ids=(record_format aac_profile bitrate back)
     while true; do
-        render_page "Configuration"
+        local -a items=(
+            "$(t config.codecs.record_format "$record_format")"
+            "$(t config.codecs.aac_profile "$aac_profile")"
+            "$(t config.codecs.bitrate "$bitrate")"
+            "$(t common.back)"
+        )
+        render_page "$(t config.title)"
         ui_gap
-        choice="$(gum choose --header "Codecs" --cursor="$UI_CURSOR" -- \
-            "Record Format:  $record_format" \
-            "AAC Profile:  $aac_profile" \
-            "Bitrate:  $bitrate" \
-            "< Back")" || return
-        case "$choice" in
-            "Record Format:"*) _cfg_edit_choice record_format "Record format" aac ogg ;;
-            "AAC Profile:"*)   _cfg_edit_input  aac_profile "AAC profile (applies to aac only)" ;;
-            "Bitrate:"*)       _cfg_edit_input  bitrate "Bitrate (kbps)" ;;
-            *) return ;;
-        esac
+        choice="$(gum choose --header "$(t config.group.codecs)" --cursor="$UI_CURSOR" -- "${items[@]}")" || return
+        for i in "${!items[@]}"; do
+            [[ "$choice" == "${items[$i]}" ]] || continue
+            case "${ids[$i]}" in
+                record_format) _cfg_edit_choice record_format "$(t config.codecs.record_format_prompt)" aac ogg ;;
+                aac_profile)   _cfg_edit_input  aac_profile "$(t config.codecs.aac_profile_prompt)" ;;
+                bitrate)       _cfg_edit_input  bitrate "$(t config.codecs.bitrate_prompt)" ;;
+                back)          return ;;
+            esac
+            break
+        done
     done
 }
 
 config_group_paths () {
-    local choice d
+    local choice d i
+    local -a ids=(output_folder filename_scheme log_file back)
     while true; do
-        render_page "Configuration"
+        local -a items=(
+            "$(t config.paths.output_folder "$output_directory")"
+            "$(t config.paths.filename_scheme "$filename_scheme")"
+            "$(t config.paths.log_file "$(effective_log_file_path)")"
+            "$(t common.back)"
+        )
+        render_page "$(t config.title)"
         ui_gap
-        choice="$(gum choose --header "Paths" --cursor="$UI_CURSOR" -- \
-            "Output Folder:  $output_directory" \
-            "Filename Scheme:  $filename_scheme" \
-            "Log Directory:  $(effective_log_directory)" \
-            "< Back")" || return
-        case "$choice" in
-            "Output Folder:"*)
-                d="$(pick_directory "${output_directory:-$HOME}")" \
-                    && [[ -n "$d" ]] && { output_directory="$d"; mkdir -p -- "$output_directory"; save_config; load_config; }
-                ;;
-            "Filename Scheme:"*)
-                _cfg_edit_choice filename_scheme "Filename scheme" normal strict strict-lc-nodir
-                ;;
-            "Log Directory:"*)
-                _cfg_edit_input log_directory "Log directory (leave empty for the default: ${TMPDIR:-/tmp}/loopcatcher)"
-                ;;
-            *) return ;;
-        esac
+        choice="$(gum choose --header "$(t config.group.paths)" --cursor="$UI_CURSOR" -- "${items[@]}")" || return
+        for i in "${!items[@]}"; do
+            [[ "$choice" == "${items[$i]}" ]] || continue
+            case "${ids[$i]}" in
+                output_folder)
+                    d="$(pick_directory "${output_directory:-$HOME}")" \
+                        && [[ -n "$d" ]] && { output_directory="$d"; mkdir -p -- "$output_directory"; save_config; config_changed=true; }
+                    ;;
+                filename_scheme)
+                    _cfg_edit_choice filename_scheme "$(t config.paths.filename_scheme_prompt)" normal strict strict-lc-nodir
+                    ;;
+                log_file)
+                    _cfg_edit_input log_file_path "$(t config.paths.log_file_prompt "${TMPDIR:-/tmp}/loopcatcher/<session>.log")"
+                    ;;
+                back) return ;;
+            esac
+            break
+        done
     done
 }
 
-config_group_player () {
-    local choice p
-    while true; do
-        render_page "Configuration"
-        ui_gap
-        choice="$(gum choose --header "Player" --cursor="$UI_CURSOR" -- \
-            "Player Profile:  $player_profile" \
-            "Sink App Name:  $sink_app_name" \
-            "MPRIS Bus:  $player_mpris_bus" \
-            "Sink Match:  $player_sink_match" \
-            "Null Sink Name:  $nulloutput_name" \
-            "< Back")" || return
-        case "$choice" in
-            "Player Profile:"*)
-                render_page "Configuration"
-                ui_gap
-                p="$(gum choose --header "Player profile" --cursor="$UI_CURSOR" --selected "$player_profile" -- spotify custom)" \
-                    && { player_profile_apply "$p"; save_config; load_config; }
-                ;;
-            "Sink App Name:"*)  _cfg_edit_detection_input sink_app_name    "Sink app name" ;;
-            "MPRIS Bus:"*)      _cfg_edit_detection_input player_mpris_bus "MPRIS bus name" ;;
-            "Sink Match:"*)     _cfg_edit_detection_input player_sink_match "Sink match (space-separated globs)" ;;
-            "Null Sink Name:"*) _cfg_edit_input nulloutput_name "Null sink name" ;;
-            *) return ;;
-        esac
+config_group_enabled_profiles () {
+    local -a all=() selected=() chosen=()
+    local m chosen_raw selected_csv
+
+    while IFS= read -r m; do
+        [[ -n "$m" ]] && all+=("$m")
+    done < <(list_profile_modules)
+    [[ ${#all[@]} -eq 0 ]] && all=("$default_profile")
+
+    for m in $enabled_profiles; do
+        selected+=("$m")
     done
+    selected_csv="$(IFS=,; printf '%s' "${selected[*]}")"
+
+    render_page "$(t config.title)"
+    ui_gap
+    if ! chosen_raw="$(gum choose --header "$(t config.enabled_profiles.header)" \
+            --cursor="$UI_CURSOR" --no-limit --selected "$selected_csv" -- "${all[@]}")"; then
+        return
+    fi
+
+    chosen=()
+    if [[ -n "$chosen_raw" ]]; then
+        while IFS= read -r m; do
+            [[ -n "$m" ]] && chosen+=("$m")
+        done <<< "$chosen_raw"
+    fi
+    case " ${chosen[*]:-} " in
+        *" $default_profile "*) ;;
+        *) chosen+=("$default_profile") ;;
+    esac
+
+    enabled_profiles="${chosen[*]}"
+    save_config
+    config_changed=true
 }
 
 config_group_advanced () {
-    local choice
+    local choice i
+    local -a ids=(tail_drain_seconds log_level nulloutput_name back)
     while true; do
-        render_page "Configuration"
+        local -a items=(
+            "$(t config.advanced.tail_drain_seconds "$tail_drain_seconds")"
+            "$(t config.advanced.log_level "$log_level")"
+            "$(t config.advanced.nulloutput_name "$nulloutput_name")"
+            "$(t common.back)"
+        )
+        render_page "$(t config.title)"
         ui_gap
-        choice="$(gum choose --header "Advanced" --cursor="$UI_CURSOR" -- \
-            "Tail Drain Seconds:  $tail_drain_seconds" \
-            "Log Level:  $log_level" \
-            "< Back")" || return
-        case "$choice" in
-            "Tail Drain Seconds:"*) _cfg_edit_input tail_drain_seconds "Tail drain seconds (e.g. 0.35)" ;;
-            "Log Level:"*)          _cfg_edit_choice log_level "Log level (0=off, 1=on, 2=debug)" 0 1 2 ;;
-            *) return ;;
-        esac
+        choice="$(gum choose --header "$(t config.group.advanced)" --cursor="$UI_CURSOR" -- "${items[@]}")" || return
+        for i in "${!items[@]}"; do
+            [[ "$choice" == "${items[$i]}" ]] || continue
+            case "${ids[$i]}" in
+                tail_drain_seconds) _cfg_edit_input tail_drain_seconds "$(t config.advanced.tail_drain_seconds_prompt)" ;;
+                log_level)          _cfg_edit_choice log_level "$(t config.advanced.log_level_prompt)" 0 1 2 ;;
+                nulloutput_name)    _cfg_edit_input nulloutput_name "$(t config.advanced.nulloutput_name_prompt)" ;;
+                back)                return ;;
+            esac
+            break
+        done
     done
 }
 
 # Reachable only from the Welcome screen; returning here always goes back to it.
+# Language lives directly here, not nested inside a group - it's the one
+# Settings field important/global enough to be one level up, alongside the
+# group picker itself, rather than buried inside Advanced.
 config_screen () {
-    local choice
+    local choice i
+    local -a ids=(codecs paths enabled_profiles advanced language back)
     while true; do
-        render_page "Configuration" \
+        local -a items=(
+            "$(t config.group.codecs)"
+            "$(t config.group.paths)"
+            "$(t config.group.enabled_profiles)"
+            "$(t config.group.advanced)"
+            "$(t config.top.language "$language")"
+            "$(t common.back)"
+        )
+        render_page "$(t config.title)" \
             "$(ui_notify \
-                "Every option below is saved automatically as soon as you change it" \
-                "You can also edit the config file directly:" \
+                "$(t config.notify.autosave)" \
+                "$(t config.notify.requires_apply)" \
+                "$(t config.notify.edit_directly)" \
                 "" \
                 "$config_path")"
         ui_gap
-        choice="$(gum choose --header "Select a group" --cursor="$UI_CURSOR" -- \
-            "Codecs" "Paths" "Player" "Advanced" "< Back")" || return
-        case "$choice" in
-            Codecs)   config_group_codecs ;;
-            Paths)    config_group_paths ;;
-            Player)   config_group_player ;;
-            Advanced) config_group_advanced ;;
-            *) return ;;
-        esac
+        choice="$(gum choose --header "$(t config.header)" --cursor="$UI_CURSOR" -- "${items[@]}")" || return
+        for i in "${!items[@]}"; do
+            [[ "$choice" == "${items[$i]}" ]] || continue
+            case "${ids[$i]}" in
+                codecs)            config_group_codecs ;;
+                paths)             config_group_paths ;;
+                enabled_profiles)  config_group_enabled_profiles ;;
+                advanced)          config_group_advanced ;;
+                language)          _cfg_edit_choice language "$(t config.top.language_prompt)" auto en es ;;
+                back)              return ;;
+            esac
+            break
+        done
     done
 }
 
 ###############################################################################
 # Recording Wizard
+#
+# wizard_step_screen() is the generic, reusable step-screen renderer: any
+# profile module's profile_run() can call it. $4 (heading) and the remaining
+# instruction-line args are expected to already be translated by the caller -
+# this function itself only knows the generic "kind" vocabulary (sink/
+# stopped/playing) for the spinner title. The actual step sequence (which
+# steps, in what order, and what conditions gate them) is owned entirely by
+# the active module - see profiles/spotify_native/profile.sh's profile_run().
 ###############################################################################
 
 wizard_step_screen () {
     local n="$1" spinner="$2" kind="$3" heading="$4"; shift 4
     local spin_title
     case "$kind" in
-        sink)    spin_title="Waiting for the audio sink..." ;;
-        stopped) spin_title="Waiting for playback to pause..." ;;
-        playing) spin_title="Waiting for playback to start..." ;;
-        *)       spin_title="Waiting..." ;;
+        sink)    spin_title="$(t wizard.spin.sink)" ;;
+        stopped) spin_title="$(t wizard.spin.stopped)" ;;
+        playing) spin_title="$(t wizard.spin.playing)" ;;
+        *)       spin_title="$(t wizard.spin.default)" ;;
     esac
 
-    render_page "Recording Wizard" \
-        "$(ui_box "$(ui_subtitle "Step $n: $heading")" "" "$@")"
+    render_page "$(t wizard.title)" \
+        "$(ui_box "$(ui_subtitle "$(t wizard.step_label "$n" "$heading")")" "" "$@")"
     ui_gap
 
     gum spin --spinner "$spinner" --title "$spin_title" -- \
         "$0" --internal-wait "$kind" --config "$config_path" \
         || _cancel_and_exit
-}
-
-recording_wizard () {
-    local label
-    label="$(player_profile_label "$player_profile")"
-
-    if ! get_target_sink_index; then
-        wizard_step_screen 1 points sink "Create the Audio Sink" \
-            "1) Open your $label" \
-            "2) Play any track that is NOT the first in your playlist or album you want to record"
-        get_target_sink_index || true
-    fi
-
-    if ! _playback_is_stopped; then
-        wizard_step_screen 2 points stopped "Prepare to record" \
-            "1) Pause the playback on your $label"
-    fi
-
-    # By this point playback is confirmed paused/stopped (step 2 guaranteed it,
-    # or it already was). Start listening for MPRIS signals now, before the
-    # user presses Play again, so the Playing transition and the first track's
-    # metadata - both one-shot signals - are not missed.
-    coproc DBUS_MONITOR { get_dbusmessages "path=/org/mpris/MediaPlayer2,member=PropertiesChanged,sender=$player_mpris_bus"; }
-    dbus_monitor_pid=$!
-
-    if ! _playback_is_playing; then
-        wizard_step_screen 3 points playing "Start recording" \
-            "1) Play the first track of your playlist or album to start the recording automatically"
-    fi
 }
 
 ###############################################################################
@@ -1025,9 +1364,9 @@ recording_wizard () {
 
 check_audio_server () {
     if ! pactl info >/dev/null 2>&1; then
-        printf 'FATAL: cannot connect to the PulseAudio/PipeWire session daemon.\n' >&2
-        printf 'On KDE, ensure pipewire-pulse is running in your user session.\n' >&2
-        printf 'Try: systemctl --user status pipewire pipewire-pulse wireplumber\n' >&2
+        printf 'FATAL: %s\n' "$(t err.audio_server_unreachable)" >&2
+        printf '%s\n' "$(t err.audio_server_kde_hint)" >&2
+        printf '%s\n' "$(t err.audio_server_try_hint)" >&2
         exit 1
     fi
 }
@@ -1102,14 +1441,14 @@ create_null_audio_output () {
     # otherwise load a fresh one. cleanup() unloads it either way.
     [[ -n "$(_null_sink_module_ids)" ]] && return 0
     if ! pactl load-module module-null-sink sink_name="$nulloutput_name" >/dev/null; then
-        printf 'FATAL: cannot create null sink "%s".\n' "$nulloutput_name" >&2
+        printf 'FATAL: %s\n' "$(t err.cannot_create_null_sink "$nulloutput_name")" >&2
         exit 1
     fi
 }
 
 move_target_output () {
     if ! pactl move-sink-input "$source_sink_index" "$nulloutput_name" 2>/dev/null; then
-        printf 'FATAL: cannot move sink-input %s to "%s".\n' "$source_sink_index" "$nulloutput_name" >&2
+        printf 'FATAL: %s\n' "$(t err.cannot_move_sink_input "$source_sink_index" "$nulloutput_name")" >&2
         exit 1
     fi
 }
@@ -1145,7 +1484,7 @@ sanitize_component () {
     s="$(printf '%s' "$s" | tr -d '\000-\037\177')"
     s="${s#"${s%%[![:space:].]*}"}"
     s="${s%"${s##*[![:space:].]}"}"
-    [[ -n "$s" ]] || s="Unknown"
+    [[ -n "$s" ]] || s="$(t filename.unknown_component)"
     printf '%s' "$s"
 }
 
@@ -1183,7 +1522,7 @@ file_path_structure () {
             ;;
         *)
             # Unreachable: filename_scheme is validated at startup.
-            printf 'FATAL: invalid filename_scheme %s\n' "$filename_scheme" >&2
+            printf 'FATAL: %s\n' "$(t err.invalid_filename_scheme_runtime "$filename_scheme")" >&2
             exit 1
             ;;
     esac
@@ -1191,67 +1530,6 @@ file_path_structure () {
     mkdir -p -- "$outdir"
     base="$outdir/$outfile"
     unique_output_path "$base"
-}
-
-###############################################################################
-# MPRIS monitor (player-scoped)
-###############################################################################
-
-# Runs as a coproc. Emits "key -> value" lines parsed by process_dbus_line.
-# If the player-scoped match rule is rejected, retries once unscoped.
-get_dbusmessages () {
-    local rule="$1"
-    local fallback="path=/org/mpris/MediaPlayer2,member=PropertiesChanged"
-    local expect_key="" expect_type="" line started=0 attempt=0
-
-    while :; do
-        attempt=$((attempt + 1))
-        while IFS= read -r line; do
-            started=1
-            case "$line" in
-                *'string "PlaybackStatus"'*)     expect_key="playbackstatus"; expect_type="string"; continue ;;
-                *'string "mpris:trackid"'*)      expect_key="trackid";        expect_type="string"; continue ;;
-                *'string "xesam:album"'*)        expect_key="album";          expect_type="string"; continue ;;
-                *'string "xesam:albumArtist"'*)  expect_key="albumartist";    expect_type="string";       continue ;;
-                *'string "xesam:artist"'*)       expect_key="artist";         expect_type="string_array";  continue ;;
-                *'string "xesam:discNumber"'*)   expect_key="discnumber";     expect_type="int32";  continue ;;
-                *'string "xesam:title"'*)        expect_key="title";          expect_type="string"; continue ;;
-                *'string "xesam:trackNumber"'*)  expect_key="tracknumber";    expect_type="int32";  continue ;;
-            esac
-
-            [[ -z "$expect_key" ]] && continue
-
-            if [[ "$expect_type" == "string" ]] && [[ $line == *'string "'* ]]; then
-                printf '%s -> %s\n' "$expect_key" "$(cut -d '"' -f2 <<< "$line")"
-                expect_key=""; expect_type=""
-            elif [[ "$expect_type" == "string_array" ]] && [[ $line == *']'* ]]; then
-                # End of the "xesam:artist" array (a bare "]" line) - stop
-                # matching further elements, without emitting a bogus one.
-                expect_key=""; expect_type=""
-            elif [[ "$expect_type" == "string_array" ]] && [[ $line == *'string "'* ]]; then
-                # One element of the "xesam:artist" array - unlike a scalar
-                # "string" field, do NOT clear expect_key/expect_type here,
-                # so every remaining element up to the closing "]" is also
-                # emitted under the same "artist" key.
-                printf '%s -> %s\n' "$expect_key" "$(cut -d '"' -f2 <<< "$line")"
-            elif [[ "$expect_type" == "int32" ]] && [[ $line == *'int32 '* ]]; then
-                # Value sits after the LAST "int32 " token, not at a fixed
-                # field position - the "variant" prefix column width varies,
-                # which previously made "awk '{print $2}'" print "int32"
-                # itself instead of the number.
-                printf '%s -> %s\n' "$expect_key" "${line##*int32 }"
-                expect_key=""; expect_type=""
-            fi
-        done < <(dbus-monitor "$rule" 2>/dev/null)
-
-        # dbus-monitor exited with no output at all -> the rule was rejected.
-        # Retry once, unscoped (degraded: other MPRIS players may bleed in).
-        if [[ $started -eq 0 && $attempt -eq 1 && "$rule" != "$fallback" ]]; then
-            rule="$fallback"
-            continue
-        fi
-        break
-    done
 }
 
 ###############################################################################
@@ -1401,6 +1679,7 @@ start_recording () {
         return 1
     fi
 
+    # shellcheck disable=SC2034  # recording_failed/status_dirty are read by the active profile module's recording_screen_render()
     recording_failed=false; status_dirty=1
     tui_set "output" "$outputfile"
 
@@ -1416,90 +1695,12 @@ start_recording () {
     return 0
 }
 
-maybe_start_recording () {
-    local signature
-
-    [[ "$playbackstatus" != "Playing" ]] && return
-    [[ -z "$title" || -z "$artist" ]] && return
-
-    signature="${trackid:-$artist|$album|$title}"
-    [[ "$signature" == "$active_recording_signature" ]] && return
-
-    if start_recording "$artist" "$album" "$title" "$albumartist" "$tracknumber" "$discnumber"; then
-        active_recording_signature="$signature"
-    fi
-}
-
-process_dbus_line () {
-    local dbus_read="$1"
-
-    # None of the branches below decide whether to (re)start recording -
-    # that happens once per drain batch, in recording_main_loop, after every
-    # currently-buffered line has been applied. A single MPRIS metadata
-    # update emits its keys (album, artist, title, trackNumber, ...) as
-    # several consecutive lines; deciding inline on whichever of title/
-    # artist/album happens to complete the pair first raced ahead of
-    # later keys in the same burst (trackNumber, in particular, is emitted
-    # after title) and locked in a stale/empty value for the rest of the
-    # track.
-    case "$dbus_read" in
-        'playbackstatus -> '*)
-            playbackstatus="${dbus_read#playbackstatus -> }"
-            status_dirty=1
-            if [[ "$playbackstatus" == "Playing" ]]; then
-                started_playing=true
-            elif [[ "$started_playing" == "true" ]]; then
-                # Any non-Playing state after playback began ends the session
-                # (no half tracks; also where Spotify lands when a playlist
-                # finishes). A pause before the first Playing is ignored.
-                stop_current_recording "drain"
-                active_recording_signature=""
-                end_session
-            fi
-            ;;
-        'trackid -> '*)
-            trackid="${dbus_read#trackid -> }"
-            if [[ "$trackid" != "$last_trackid" ]]; then
-                last_trackid="$trackid"
-                active_recording_signature=""
-                title="" artist="" album="" albumartist="" tracknumber="" discnumber=""
-                artist_all=()
-                stop_current_recording
-            fi
-            ;;
-        'title -> '*)       title="${dbus_read#title -> }";             tui_set "track" "$title" ;;
-        'artist -> '*)
-            local _artist_value="${dbus_read#artist -> }"
-            # First xesam:artist element of this track becomes the scalar
-            # "artist" (naming/log/AAC tag); every element - first included -
-            # is also collected into artist_all (table display/OGG tags).
-            [[ ${#artist_all[@]} -eq 0 ]] && artist="$_artist_value"
-            artist_all+=("$_artist_value")
-            tui_set "artist" "$(join_artist_list)"
-            ;;
-        'album -> '*)       album="${dbus_read#album -> }";             tui_set "album" "$album" ;;
-        'albumartist -> '*) albumartist="${dbus_read#albumartist -> }" ;;
-        'tracknumber -> '*) tracknumber="${dbus_read#tracknumber -> }"; tui_set "tracknumber" "$tracknumber" ;;
-        'discnumber -> '*)  discnumber="${dbus_read#discnumber -> }";   tui_set "discnumber" "$discnumber" ;;
-    esac
-}
-
 ###############################################################################
-# Recording screen
+# Recording screen support (generic helpers - the screen itself is rendered
+# by the active profile module's recording_screen_render(), which calls these)
 ###############################################################################
 
-# Every captured xesam:artist value, joined with "; " - used for the
-# Metadata table and for OGG tagging (which writes them back out as separate
-# ARTIST= comment fields). Naming, the session log, and the AAC tag use only
-# the first value (the scalar "artist"), never this.
-join_artist_list () {
-    local joined="" a
-    for a in "${artist_all[@]}"; do
-        [[ -z "$joined" ]] && joined="$a" || joined="$joined; $a"
-    done
-    printf '%s' "$joined"
-}
-
+# shellcheck disable=SC2034  # tui_*/status_dirty are read by the active profile module's recording_screen_render()
 tui_set () {
     case "$1" in
         track)       tui_track="$2" ;;
@@ -1533,88 +1734,10 @@ _kill_spinner () {
     _spinner_pid=""
 }
 
-recording_screen_render () {
-    [[ -t 1 ]] || return
-    _kill_spinner
-
-    local info meta status frame catcher_status="Recording"
-    [[ "$recording_failed" == "true" ]] && catcher_status="Failed"
-
-    info="$(ui_kv_table 'Info' '' \
-        'Output Folder' "$(clip_text "${output_directory:--}")" \
-        'Session Name' "$(clip_text "${session_name:--}")" \
-        'Config File' "$(clip_text "$config_path")" \
-        'Audio Sink' "${source_sink_index:--}")"
-
-    meta="$(ui_kv_table 'Metadata' '' \
-        'Artist' "$(clip_text "${tui_artist:--}")" \
-        'Album' "$(clip_text "${tui_album:--}")" \
-        'Track' "$(clip_text "${tui_track:--}")" \
-        'Track No.' "$(clip_text "${tui_tracknumber:--}")" \
-        'Disc No.' "$(clip_text "${tui_discnumber:--}")" \
-        'Output File' "$(clip_text "$(status_output_relpath)")")"
-
-    # Playback Status is printed exactly as MPRIS reports it (Playing/Paused/
-    # Stopped/...), with no relabelling.
-    status="$(ui_kv_table 'Status' '' \
-        'Catcher Status' "$catcher_status" \
-        'Playback Status' "$playbackstatus")"
-
-    printf -v frame '%s\n%s\n%s\n%s\n' \
-        "$(ui_title_row 'Recording')" "$info" "$meta" "$status"
-
-    paint_frame "$frame"
-    ui_gap
-
-    gum spin --spinner dot --title "${catcher_status}..." -- sleep 999999 &
-    _spinner_pid=$!
-}
-
+# shellcheck disable=SC2034  # should_exit is read by the active profile module's recording_main_loop()
 end_session () {
     session_ended=true
     should_exit=1
-}
-
-recording_main_loop () {
-    # Snapshot the coproc fd: bash may unset the DBUS_MONITOR array once the
-    # coprocess exits, and "set -u" would then abort on ${DBUS_MONITOR[0]}.
-    local dbus_fd="${DBUS_MONITOR[0]}"
-    local dbus_read last_liveness=$SECONDS
-
-    while [[ $should_exit -eq 0 ]]; do
-        if ! kill -0 "$dbus_monitor_pid" 2>/dev/null; then
-            exit_note="loopcatcher: dbus-monitor ended, session stopped."
-            break
-        fi
-
-        # Drain every line already buffered before repainting, so a metadata
-        # burst (trackid + title + artist + album) collapses into ONE repaint.
-        local dbus_activity=0
-        while IFS= read -r -t 0.2 -u "$dbus_fd" dbus_read 2>/dev/null; do
-            process_dbus_line "$dbus_read"
-            dbus_activity=1
-            [[ $should_exit -eq 0 ]] || break
-        done
-
-        # Decide once per drain batch, after every buffered key of the burst
-        # has been applied - not per key line - so a field emitted later in
-        # the same MPRIS update (trackNumber comes after title) is already
-        # in place before recording is (re)started.
-        [[ $dbus_activity -eq 1 && $should_exit -eq 0 ]] && maybe_start_recording
-
-        # Catch a player that quit outright (no Paused/Stopped signal reaches
-        # the still-running dbus-monitor). Checked on a ~2s wall-clock timer.
-        if [[ $should_exit -eq 0 && $(( SECONDS - last_liveness )) -ge 2 ]]; then
-            last_liveness=$SECONDS
-            poll_player_liveness
-        fi
-
-        # One repaint per tick, only when something changed.
-        if [[ $status_dirty -eq 1 && $should_exit -eq 0 ]]; then
-            status_dirty=0
-            recording_screen_render
-        fi
-    done
 }
 
 ###############################################################################
@@ -1622,11 +1745,11 @@ recording_main_loop () {
 ###############################################################################
 
 finish_screen () {
-    render_page_plain "Recording Finished" \
-        "$(ui_notify "Recording session finished")" \
-        "$(ui_box "Your recordings are saved in:" "" "$session_output_directory")"
+    render_page_plain "$(t finish.title)" \
+        "$(ui_notify "$(t finish.notification)")" \
+        "$(ui_box "$(t finish.saved_in)" "" "$session_output_directory")"
     ui_gap
-    printf '%s\n' "$(gum style --bold -- 'Press any key to exit.')"
+    printf '%s\n' "$(gum style --bold -- "$(t finish.press_any_key_exit)")"
     read -rsn1 || true
 }
 
@@ -1648,8 +1771,8 @@ cleanup () {
     _kill_spinner
     # "drain" so a manual quit mid-track still finalizes the current file.
     stop_current_recording "drain"
-    if [[ -n "$dbus_monitor_pid" ]] && kill -0 "$dbus_monitor_pid" 2>/dev/null; then
-        kill "$dbus_monitor_pid" 2>/dev/null || true
+    if declare -F profile_cleanup >/dev/null 2>&1; then
+        profile_cleanup
     fi
     remove_null_sink
     screen_leave
@@ -1661,81 +1784,33 @@ cleanup () {
 
 ###############################################################################
 # CLI
+#
+# Deliberately minimal: everything else lives in the config file / TUI now.
+# --output/--session/--format/--aac-profile/--bitrate/--scheme/--config were
+# all removed for this - config_group_paths (Output Folder, Filename Scheme),
+# config_group_codecs (Record Format, AAC Profile, Bitrate), and Session Name
+# screen are the only way to set them any more.
 ###############################################################################
 
 get_options () {
-    local usage="loopcatcher v${SCRIPT_VERSION}
+    local usage
+    usage="$(t cli.usage "$SCRIPT_VERSION" "${0##*/}")"
 
-Usage: ${0##*/} [options]
-
-Behavior:
-  - The Welcome screen shows the current (or default) configuration; accept it
-    or open the Configuration screen to change it.
-  - Session name is asked interactively (prefilled with a timestamp; just press
-    Enter). Provide --session to skip the prompt.
-  - Output goes to: output-directory/session-name
-  - The Recording Wizard walks you through creating the audio sink, pausing,
-    then starting playback to begin recording automatically.
-  - The session ends automatically when playback pauses, stops, or the player
-    quits.
-
-Options:
-  --debug                   Set log_level to 2 (adds encoder diagnostics to the session log)
-  --output <dir>            Output directory
-  --session <name>          Session name (skips the prompt)
-  --format <format>         Record format: aac or ogg
-  --aac-profile <id>        AAC profile (aac only)
-  --bitrate <kbps>          Bitrate target
-  --scheme <scheme>         Filename scheme: normal, strict, strict-lc-nodir
-  --config <path>           Override config file path
-  --help                    Show help
-  --version                 Show version
-"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --debug)          log_level=2; shift ;;
-            --help)           show_help=true; shift ;;
-            --version)        show_version=true; shift ;;
-            --output)         [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }; output_directory="$2"; shift 2 ;;
-            --output=*)       output_directory="${1#*=}"; shift ;;
-            --session)        [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }; session_name="$2"; shift 2 ;;
-            --session=*)      session_name="${1#*=}"; shift ;;
-            --aac-profile)    [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }; aac_profile="$2"; shift 2 ;;
-            --aac-profile=*)  aac_profile="${1#*=}"; shift ;;
-            --bitrate)        [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }; bitrate="$2"; shift 2 ;;
-            --bitrate=*)      bitrate="${1#*=}"; shift ;;
-            --config)         [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }; config_path="$2"; config_dir="$(dirname "$config_path")"; shift 2 ;;
-            --config=*)       config_path="${1#*=}"; config_dir="$(dirname "$config_path")"; shift ;;
-            --format)
-                [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }
-                record_format="$2"
-                case "$record_format" in aac|ogg) ;; *) printf 'Invalid --format value: %s\n' "$record_format"; exit 1 ;; esac
-                shift 2
-                ;;
-            --format=*)
-                record_format="${1#*=}"
-                case "$record_format" in aac|ogg) ;; *) printf 'Invalid --format value: %s\n' "$record_format"; exit 1 ;; esac
-                shift
-                ;;
-            --scheme)
-                [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }
-                filename_scheme="$2"
-                case "$filename_scheme" in normal|strict|strict-lc-nodir) ;; *) printf 'Invalid --scheme value: %s\n' "$filename_scheme"; exit 1 ;; esac
-                shift 2
-                ;;
-            --scheme=*)
-                filename_scheme="${1#*=}"
-                case "$filename_scheme" in normal|strict|strict-lc-nodir) ;; *) printf 'Invalid --scheme value: %s\n' "$filename_scheme"; exit 1 ;; esac
-                shift
-                ;;
+            --debug)      log_level=2; shift ;;
+            --help)       show_help=true; shift ;;
+            --version)    show_version=true; shift ;;
+            --logname)    [[ $# -lt 2 ]] && { printf '%s\n' "$usage"; exit 1; }; log_file_path="$2"; shift 2 ;;
+            --logname=*)  log_file_path="${1#*=}"; shift ;;
             --) shift ;;
             -*) printf '%s\n' "$usage"; exit 1 ;;
-            *)  printf 'Unknown argument: %s\n\n' "$1"; printf '%s\n' "$usage"; exit 1 ;;
+            *)  printf '%s\n\n%s\n' "$(t cli.unknown_argument "$1")" "$usage"; exit 1 ;;
         esac
     done
 
     [[ "$show_help" == "true" ]] && { printf '%s\n' "$usage"; exit 0; }
-    [[ "$show_version" == "true" ]] && { printf 'loopcatcher version %s\n' "$SCRIPT_VERSION"; exit 0; }
+    [[ "$show_version" == "true" ]] && { printf '%s\n' "$(t cli.version_line "$SCRIPT_VERSION")"; exit 0; }
     return 0
 }
 
@@ -1755,10 +1830,9 @@ _internal_wait () {
     done
     load_config
     case "$kind" in
-        sink)    until get_target_sink_index; do sleep 1; done ;;
-        stopped) until _playback_is_stopped;  do sleep 1; done ;;
-        playing) until _playback_is_playing;  do sleep 1; done ;;
-        *)       return 1 ;;
+        sink)             until get_target_sink_index; do sleep 1; done ;;
+        stopped|playing)  until profile_wait_condition "$kind"; do sleep 1; done ;;
+        *)                return 1 ;;
     esac
 }
 
@@ -1774,6 +1848,7 @@ main () {
     ensure_config_dir
     load_config
     get_options "$@"          # CLI flags win over the config file
+    [[ -n "$output_directory" ]] || { output_directory="$(default_music_dir)"; save_config; }
     validate_settings
     check_encoder_dependency
 
@@ -1784,25 +1859,15 @@ main () {
     init_session_log
 
     trap cleanup EXIT
-    trap 'should_exit=1' INT TERM
+    # A manual Ctrl+C on the Recording screen ends the session exactly like a
+    # pause/stop signal or the player quitting would (end_session sets both
+    # session_ended=true and should_exit=1) - not just should_exit=1 alone,
+    # which broke recording_main_loop's wait but left session_ended false, so
+    # the check below silently skipped the Finish screen instead of showing it.
+    trap 'end_session' INT TERM
 
-    recording_wizard
+    profile_run
 
-    create_null_audio_output
-    move_target_output
-
-    # The Recording screen is only ever shown while a session is underway;
-    # Catcher Status starts "Recording" (recording_failed defaults false) - see
-    # "Global state" above.
-    screen_enter
-    trap 'status_dirty=1' WINCH
-
-    status_dirty=0
-    recording_screen_render
-
-    recording_main_loop
-
-    _kill_spinner
     [[ "$session_ended" == "true" ]] && finish_screen
 }
 

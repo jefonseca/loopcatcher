@@ -21,10 +21,18 @@ jobs:
           sudo apt-get install -y shellcheck
 
       - name: Bash syntax check
-        run: bash -n loopcatcher
+        # See ci.yml's equivalent step for why this loops instead of passing
+        # every file to one "bash -n" call.
+        run: |
+          for f in loopcatcher lang/*.sh profiles/*/profile.sh profiles/*/lang/*.sh; do
+            bash -n "$f"
+          done
 
       - name: ShellCheck (script)
         run: shellcheck loopcatcher
+
+      - name: ShellCheck (lang catalogs and profile modules)
+        run: shellcheck -e SC1090,SC2030,SC2031,SC2034,SC2154,SC2317 lang/*.sh profiles/*/profile.sh profiles/*/lang/*.sh
 
       - name: ShellCheck (tests)
         run: shellcheck -e SC1090,SC2030,SC2031,SC2034,SC2154,SC2317 tests/test.sh
