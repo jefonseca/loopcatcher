@@ -1,3 +1,34 @@
+loopcatcher (0.2.3-1) unstable; urgency=medium
+
+  * Add English/Spanish translations for the whole app (Settings ->
+    Advanced -> Language, auto-detected on first run).
+  * Reduce the CLI to --help/--version/--debug/--logname - output
+    directory, session name, codec, bitrate and filename scheme are now
+    config/TUI-only (Settings, Session Name screen).
+  * Settings/Profile Settings edits still save to disk immediately, but no
+    longer reload into the running process - use the new Restart item on
+    the Welcome menu to apply them.
+  * Fix Ctrl+C on the Recording screen silently exiting without showing
+    the Finish screen.
+
+ -- Kike Fonseca <filipok@gmail.com>  Mon, 31 Aug 2026 18:00:00 +0000
+
+loopcatcher (0.2.2-1) unstable; urgency=medium
+
+  * Split the Spotify-specific logic out into a loadable profile module
+    (profiles/spotify_native), the first step of a modular, multi-player
+    architecture - the fixed Welcome/Settings/Session Name/Finish screens
+    and the encoding engine now stay in the main script regardless of
+    which profile is active.
+  * Add a Profile menu (Change Profile / Profile Settings / About Profile)
+    and an Enabled Profiles setting to the Welcome screen.
+  * Rename the log_directory config key to log_file_path (now a full file
+    path instead of a directory).
+  * Drop the "custom" MPRIS player profile for this release - a dedicated
+    generic-MPRIS module is planned for a future release.
+
+ -- Kike Fonseca <filipok@gmail.com>  Mon, 31 Aug 2026 12:00:00 +0000
+
 loopcatcher (0.2.1-1) unstable; urgency=medium
 
   * Restructure the UI on top of gum, kept minimal and simple.

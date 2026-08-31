@@ -18,7 +18,15 @@ jobs:
           sudo apt-get install -y shellcheck appstream desktop-file-utils
 
       - name: Bash syntax check
-        run: bash -n loopcatcher
+        # "bash -n file1 file2" only checks file1 - the rest become $1/$2 to
+        # it (silently unchecked) - so this loops instead of listing them all
+        # on one invocation. Globs (not an enumerated file list) so a new
+        # lang/<code>.sh or profiles/<name>/lang/<code>.sh is covered
+        # automatically, without editing this workflow.
+        run: |
+          for f in loopcatcher lang/*.sh profiles/*/profile.sh profiles/*/lang/*.sh; do
+            bash -n "$f"
+          done
 
       - name: Validate AppStream metainfo
         run: appstreamcli validate --pedantic packaging/io.github.jefonseca.loopcatcher.metainfo.xml
@@ -28,6 +36,9 @@ jobs:
 
       - name: ShellCheck (script)
         run: shellcheck loopcatcher
+
+      - name: ShellCheck (lang catalogs and profile modules)
+        run: shellcheck -e SC1090,SC2030,SC2031,SC2034,SC2154,SC2317 lang/*.sh profiles/*/profile.sh profiles/*/lang/*.sh
 
       - name: ShellCheck (tests)
         run: shellcheck -e SC1090,SC2030,SC2031,SC2034,SC2154,SC2317 tests/test.sh

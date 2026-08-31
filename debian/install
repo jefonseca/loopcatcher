@@ -1,5 +1,7 @@
 loopcatcher usr/bin/
 VERSION usr/share/loopcatcher/
+lang usr/share/loopcatcher/
+profiles/spotify_native usr/share/loopcatcher/profiles/
 packaging/io.github.jefonseca.loopcatcher.desktop usr/share/applications/
 packaging/io.github.jefonseca.loopcatcher.metainfo.xml usr/share/metainfo/
 icons/32x32/loopcatcher.png usr/share/icons/hicolor/32x32/apps/

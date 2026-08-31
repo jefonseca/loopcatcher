@@ -4,8 +4,21 @@
 
 set -u
 
+# Deterministic language regardless of the runner's own locale - most tests
+# assert exact English catalog text, and the default $language ("auto")
+# resolving to effective_language="en" is only guaranteed when
+# detect_system_language() doesn't see a Spanish LANG/LC_ALL/LC_MESSAGES.
+# Tests that need a specific language set $effective_language directly
+# (skipping resolution) or $language (to exercise resolve_language() itself)
+# - see individual tests for which. test_detect_system_language_from_lang_env
+# and test_resolve_language_* override these explicitly, per-call, to test
+# detection/resolution themselves.
+export LANG=C LC_ALL=C LC_MESSAGES=C
+
 ROOT_DIR="$(dirname "$(dirname "$(readlink -f "$0")")")"
 SCRIPT_PATH="$ROOT_DIR/loopcatcher"
+SPOTIFY_NATIVE_PATH="$ROOT_DIR/profiles/spotify_native/profile.sh"
+SPOTIFY_NATIVE_LANG_DIR="$ROOT_DIR/profiles/spotify_native/lang"
 
 # shellcheck disable=SC1090
 
@@ -28,36 +41,32 @@ assert_contains () {
     [[ "$haystack" == *"$needle"* ]]
 }
 
+# Sources the main script, then the spotify_native module's own lang/ dir
+# (via loopcatcher's own load_lang_dir(), same as a real run would) and
+# profile.sh - the same set a real run ends up with active after
+# load_config(). Used by every test that needs a player-profile function
+# (get_dbusmessages, process_dbus_line, ...) without needing an interactive
+# gum session to load it via load_config.
+source_with_spotify_native () {
+    # shellcheck disable=SC1090
+    source "$SCRIPT_PATH"
+    load_lang_dir "$SPOTIFY_NATIVE_LANG_DIR"
+    # shellcheck disable=SC1090
+    source "$SPOTIFY_NATIVE_PATH"
+}
+
 test_help_contains_long_options () {
     local out
     out="$($SCRIPT_PATH --help 2>&1)"
 
     assert_contains "$out" "--help" || return 1
     assert_contains "$out" "--version" || return 1
-    assert_contains "$out" "--output" || return 1
-    assert_contains "$out" "--session" || return 1
-}
-
-test_invalid_format_rejected () {
-    local out
-    set +e
-    out="$($SCRIPT_PATH --format mp3 2>&1)"
-    local status=$?
-    set -e
-
-    [[ $status -ne 0 ]] || return 1
-    assert_contains "$out" "Invalid --format value"
-}
-
-test_invalid_scheme_rejected () {
-    local out
-    set +e
-    out="$($SCRIPT_PATH --scheme bad 2>&1)"
-    local status=$?
-    set -e
-
-    [[ $status -ne 0 ]] || return 1
-    assert_contains "$out" "Invalid --scheme value"
+    assert_contains "$out" "--debug" || return 1
+    assert_contains "$out" "--logname" || return 1
+    # Regression guard for the CLI reduction itself - these flags are gone.
+    assert_contains "$out" "--output" && return 1
+    assert_contains "$out" "--session" && return 1
+    return 0
 }
 
 test_file_path_structure_and_uniqueness () {
@@ -66,13 +75,13 @@ test_file_path_structure_and_uniqueness () {
     tmpdir="$(mktemp -d)"
 
     # shellcheck disable=SC2034
-    out1="$({ source "$SCRIPT_PATH"; session_output_directory="$tmpdir"; filename_scheme="normal"; file_path_structure "Artist" "Album" "Song" "m4a"; })"
+    out1="$({ source_with_spotify_native; session_output_directory="$tmpdir"; filename_scheme="normal"; file_path_structure "Artist" "Album" "Song" "m4a"; })"
     [[ "$out1" == *"Artist/Album/Song.m4a" ]] || return 1
 
     touch "$out1"
 
     # shellcheck disable=SC2034
-    out2="$({ source "$SCRIPT_PATH"; session_output_directory="$tmpdir"; filename_scheme="normal"; file_path_structure "Artist" "Album" "Song" "m4a"; })"
+    out2="$({ source_with_spotify_native; session_output_directory="$tmpdir"; filename_scheme="normal"; file_path_structure "Artist" "Album" "Song" "m4a"; })"
     [[ "$out2" == *"Artist/Album/Song_2.m4a" ]] || return 1
 
     rm -rf "$tmpdir"
@@ -82,7 +91,7 @@ test_pause_stops_session () {
     local out
     # shellcheck disable=SC2034
     out="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         # shellcheck disable=SC2317
         stop_current_recording () { :; }
         started_playing=true
@@ -98,7 +107,7 @@ test_pause_before_first_play_does_not_exit () {
     local out
     # shellcheck disable=SC2034
     out="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         # shellcheck disable=SC2317
         stop_current_recording () { :; }
         started_playing=false
@@ -151,7 +160,7 @@ test_track_change_resets_metadata () {
     local out
     # shellcheck disable=SC2034
     out="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         # shellcheck disable=SC2317
         stop_current_recording () { :; }
         title="Old Title"
@@ -171,7 +180,7 @@ test_get_dbusmessages_parses_int32_values () {
     local out
     # shellcheck disable=SC2034
     out="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         # shellcheck disable=SC2317
         dbus-monitor () {
             cat <<'EOF'
@@ -195,7 +204,7 @@ test_get_dbusmessages_parses_multiple_artist_values () {
     local out
     # shellcheck disable=SC2034
     out="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         # shellcheck disable=SC2317
         dbus-monitor () {
             cat <<'EOF'
@@ -222,7 +231,7 @@ test_process_dbus_line_collects_all_artist_values () {
     local out
     # shellcheck disable=SC2034
     out="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         process_dbus_line "artist -> Metallica"
         process_dbus_line "artist -> Apocalyptica"
         printf '%s|%s|%s' "$artist" "${#artist_all[@]}" "$(join_artist_list)"
@@ -236,7 +245,7 @@ test_start_recording_ogg_writes_all_artists_as_separate_fields () {
     tmpdir="$(mktemp -d)"
     # shellcheck disable=SC2034
     out="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         # shellcheck disable=SC2317
         ensure_target_routed () { return 0; }
         # shellcheck disable=SC2317
@@ -259,7 +268,7 @@ test_maybe_start_recording_waits_for_full_metadata_burst () {
     local out
     # shellcheck disable=SC2034
     out="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         # shellcheck disable=SC2317
         start_recording () { printf '%s|%s|%s|%s|%s|%s' "$1" "$2" "$3" "$4" "$5" "$6"; return 0; }
         playbackstatus="Playing"
@@ -327,35 +336,92 @@ test_start_recording_routing_failure_sets_recording_failed () {
     [[ "$out" == "true" ]]
 }
 
-test_player_profile_apply_spotify_overwrites () {
+test_list_profile_modules_finds_spotify_native () {
     local out
-    # shellcheck disable=SC2034
-    out="$({
-        source "$SCRIPT_PATH"
-        sink_app_name="x"
-        player_mpris_bus="y"
-        player_sink_match="z"
-        player_profile_apply spotify
-        printf '%s|%s|%s' "$player_profile" "$sink_app_name" "$player_mpris_bus"
-        [[ "$player_sink_match" == *"spotify"* ]] && printf '|match'
-    })"
+    out="$({ source "$SCRIPT_PATH"; list_profile_modules; })"
 
-    [[ "$out" == "spotify|spotify|org.mpris.MediaPlayer2.spotify|match" ]]
+    assert_contains "$out" "spotify_native"
 }
 
-test_player_profile_custom_preserves_fields () {
-    local out
+test_load_config_falls_back_to_spotify_native_when_invalid () {
+    local out cfg
+    cfg="$(mktemp)"
+    cat > "$cfg" <<'EOF'
+log_level="1"
+default_profile="bogus_module"
+EOF
     # shellcheck disable=SC2034
     out="$({
         source "$SCRIPT_PATH"
-        sink_app_name="foobar"
-        player_mpris_bus="org.mpris.MediaPlayer2.foobar"
-        player_sink_match="foobar*"
-        player_profile_apply custom
-        printf '%s|%s|%s|%s' "$player_profile" "$sink_app_name" "$player_mpris_bus" "$player_sink_match"
+        config_path="$cfg"
+        load_config
+        printf '%s' "$default_profile"
     })"
+    rm -f "$cfg"
 
-    [[ "$out" == "custom|foobar|org.mpris.MediaPlayer2.foobar|foobar*" ]]
+    [[ "$out" == "spotify_native" ]]
+}
+
+test_load_config_seeds_missing_profile_section () {
+    local out cfg
+    cfg="$(mktemp)"
+    cat > "$cfg" <<'EOF'
+log_level="1"
+default_profile="spotify_native"
+enabled_profiles="spotify_native"
+EOF
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        config_path="$cfg"
+        load_config
+        printf '%s|%s|' "$spotify_native_sink_app_name" "$sink_app_name"
+        grep -c '^spotify_native_' "$cfg"
+    })"
+    rm -f "$cfg"
+
+    [[ "$out" == "spotify|spotify|3" ]]
+}
+
+test_save_config_preserves_inactive_module_lines () {
+    local out cfg
+    cfg="$(mktemp)"
+    cat > "$cfg" <<'EOF'
+log_level="1"
+default_profile="spotify_native"
+enabled_profiles="spotify_native"
+some_other_module_setting="kept"
+EOF
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        config_path="$cfg"
+        load_config
+        save_config
+        grep -c '^some_other_module_setting="kept"$' "$cfg"
+    })"
+    rm -f "$cfg"
+
+    [[ "$out" == "1" ]]
+}
+
+test_enabled_profiles_always_includes_default_profile () {
+    local out cfg
+    cfg="$(mktemp)"
+    cat > "$cfg" <<'EOF'
+default_profile="spotify_native"
+enabled_profiles=""
+EOF
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        config_path="$cfg"
+        load_config
+        printf '%s' "$enabled_profiles"
+    })"
+    rm -f "$cfg"
+
+    assert_contains "$out" "spotify_native"
 }
 
 test_status_output_relpath () {
@@ -378,28 +444,6 @@ test_status_output_relpath () {
     [[ "$out" == "Artist/Album/Track.m4a|-|/m/sess/x.m4a" ]]
 }
 
-test_cfg_edit_detection_input_flips_to_custom () {
-    local out cfg
-    cfg="$(mktemp)"
-    # shellcheck disable=SC2034
-    out="$({
-        source "$SCRIPT_PATH"
-        # shellcheck disable=SC2317
-        render_page () { :; }
-        # shellcheck disable=SC2317
-        ui_cancel_hint () { :; }
-        # shellcheck disable=SC2317
-        gum () { case "$1" in input) printf 'myplayer' ;; *) : ;; esac; }
-        config_path="$cfg"
-        player_profile="spotify"
-        _cfg_edit_detection_input sink_app_name "sink_app_name"
-        printf '%s|%s' "$player_profile" "$sink_app_name"
-    })"
-    rm -f "$cfg"
-
-    [[ "$out" == "custom|myplayer" ]]
-}
-
 test_is_target_sink_app_profile_driven () {
     local out
     # shellcheck disable=SC2034
@@ -414,20 +458,25 @@ test_is_target_sink_app_profile_driven () {
     [[ "$out" == "acme-yes spotify-no" ]]
 }
 
-test_invalid_player_profile_rejected () {
-    local rc
+test_invalid_default_profile_rejected () {
+    local rc cfg
+    cfg="$(mktemp)"
     rc="$({
         source "$SCRIPT_PATH"
-        player_profile="bogus"
+        config_path="$cfg"
+        load_config
+        default_profile="bogus"
+        enabled_profiles="spotify_native"
         validate_settings_soft >/dev/null 2>&1
         printf '%s' "$?"
     })"
+    rm -f "$cfg"
 
     [[ "$rc" != "0" ]]
 }
 
-# Counts every persisted key rather than naming a handful, so it catches ANY
-# key silently dropped from save_config's heredoc, not just a chosen few.
+# Counts every persisted generic + active-module key rather than naming a
+# handful, so it catches ANY key silently dropped from save_config.
 test_save_config_persists_all_fields () {
     local out cfg
     cfg="$(mktemp)"
@@ -435,41 +484,40 @@ test_save_config_persists_all_fields () {
     out="$({
         source "$SCRIPT_PATH"
         config_path="$cfg"
-        player_profile="custom"
-        sink_app_name="foo"
-        player_mpris_bus="org.mpris.MediaPlayer2.foo"
-        player_sink_match="foo*"
-        log_directory="/custom/logs"
+        load_config
+        log_file_path="/custom/logs/x.log"
         save_config
         grep -c -E '^[a-z_]+="' "$cfg"
     })"
     rm -f "$cfg"
 
-    [[ "$out" == "13" ]]
+    # 12 fixed generic keys (including language) + 3 spotify_native_* module keys.
+    [[ "$out" == "15" ]]
 }
 
-test_effective_log_directory_default_and_override () {
+test_effective_log_file_path_default_and_override () {
     local out
     out="$({
         source "$SCRIPT_PATH"
-        log_directory=""
-        effective_log_directory
+        log_file_path=""
+        session_name="mysession"
+        effective_log_file_path
         printf '|'
-        log_directory="/custom/logs"
-        effective_log_directory
+        log_file_path="/custom/logs/x.log"
+        effective_log_file_path
     })"
 
-    [[ "$out" == "${TMPDIR:-/tmp}/loopcatcher|/custom/logs" ]]
+    [[ "$out" == "${TMPDIR:-/tmp}/loopcatcher/mysession.log|/custom/logs/x.log" ]]
 }
 
-test_init_session_log_respects_log_directory () {
+test_init_session_log_respects_log_file_path () {
     local out base
     base="$(mktemp -d)"
     # shellcheck disable=SC2034
     out="$({
         source "$SCRIPT_PATH"
         log_level=1
-        log_directory="$base/custom-logs"
+        log_file_path="$base/custom-logs/mysession.log"
         session_name="mysession"
         init_session_log
         printf '%s' "$session_log_path"
@@ -486,7 +534,7 @@ test_log_level_0_writes_no_log_at_all () {
     out="$({
         source "$SCRIPT_PATH"
         log_level=0
-        log_directory="$base/logs"
+        log_file_path="$base/logs/mysession.log"
         session_name="mysession"
         init_session_log
         log_line "should not be written"
@@ -503,7 +551,7 @@ test_log_debug_gated_by_log_level () {
     base="$(mktemp -d)"
     out="$({
         source "$SCRIPT_PATH"
-        log_directory="$base"
+        log_file_path="$base/session.log"
         session_name="mysession"
 
         log_level=1
@@ -527,7 +575,7 @@ test_stop_current_recording_logs_duration_with_track_and_disc () {
     out="$({
         source "$SCRIPT_PATH"
         log_level=1
-        log_directory="$base"
+        log_file_path="$base/session.log"
         session_name="mysession"
         init_session_log
         record_start_seconds=$((SECONDS - 3))
@@ -550,36 +598,19 @@ test_stop_current_recording_logs_duration_with_track_and_disc () {
 }
 
 test_invalid_log_level_rejected () {
-    local rc
+    local rc cfg
+    cfg="$(mktemp)"
     rc="$({
         source "$SCRIPT_PATH"
+        config_path="$cfg"
+        load_config
         log_level="3"
         validate_settings_soft >/dev/null 2>&1
         printf '%s' "$?"
     })"
-
-    [[ "$rc" != "0" ]]
-}
-
-test_load_config_backfills_player () {
-    local out cfg
-    cfg="$(mktemp)"
-    cat > "$cfg" <<'EOF'
-log_level="1"
-record_format="aac"
-bitrate="48"
-filename_scheme="normal"
-EOF
-    # shellcheck disable=SC2034
-    out="$({
-        source "$SCRIPT_PATH"
-        config_path="$cfg"
-        load_config
-        printf '%s|%s' "$player_profile" "$player_mpris_bus"
-    })"
     rm -f "$cfg"
 
-    [[ "$out" == "spotify|org.mpris.MediaPlayer2.spotify" ]]
+    [[ "$rc" != "0" ]]
 }
 
 test_default_session_name_format () {
@@ -622,7 +653,7 @@ test_dir_not_empty () {
 test_player_bus_has_owner_empty_bus_is_alive () {
     local rc
     rc="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         player_mpris_bus=""
         player_bus_has_owner
         printf '%s' "$?"
@@ -635,7 +666,7 @@ test_player_exit_ends_session_after_two_misses () {
     local out
     # shellcheck disable=SC2034
     out="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         # shellcheck disable=SC2317
         stop_current_recording () { :; }
         # shellcheck disable=SC2317
@@ -654,7 +685,7 @@ test_player_liveness_ignored_before_first_play () {
     local out
     # shellcheck disable=SC2034
     out="$({
-        source "$SCRIPT_PATH"
+        source_with_spotify_native
         # shellcheck disable=SC2317
         player_bus_has_owner () { return 1; }
         # shellcheck disable=SC2317
@@ -685,7 +716,7 @@ test_internal_wait_invalid_kind_returns_1 () {
     local rc
     rc="$({
         source "$SCRIPT_PATH"
-        _internal_wait bogus --config /nonexistent
+        _internal_wait bogus --config /nonexistent 2>/dev/null
         printf '%s' "$?"
     })"
 
@@ -708,6 +739,187 @@ test_internal_wait_sink_returns_once_condition_met () {
     [[ "$out" == "0" ]]
 }
 
+test_logname_sets_log_file_path () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        get_options --logname /custom/logs/x.log
+        printf '%s' "$log_file_path"
+    })"
+
+    [[ "$out" == "/custom/logs/x.log" ]]
+}
+
+test_t_returns_english_by_default () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        effective_language="en"
+        t ui.cancelled
+    })"
+
+    [[ "$out" == "Cancelled." ]]
+}
+
+test_t_returns_spanish_when_language_is_es () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        effective_language="es"
+        load_lang_dir "$(lang_root)"
+        t ui.cancelled
+    })"
+
+    [[ "$out" == "Cancelado." ]]
+}
+
+test_t_falls_back_to_english_for_missing_spanish_translation () {
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        effective_language="es"
+        load_lang_dir "$(lang_root)"
+        MSG_en[test.only_in_english]="only in english"
+        t test.only_in_english
+    })"
+
+    [[ "$out" == "only in english" ]]
+}
+
+# Regression guard: t() must never crash (the "invalid arithmetic operator"
+# bug hit during development) when $effective_language names a catalog that
+# was never actually loaded - a corrupted/partial install missing
+# lang/es.sh, or a config file persisting a language whose file didn't load
+# this run. Falls back to English rather than erroring.
+test_t_gracefully_falls_back_when_language_catalog_never_loaded () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        effective_language="es"
+        # Deliberately no load_lang_dir call here.
+        t ui.cancelled
+    })"
+
+    [[ "$out" == "Cancelled." ]]
+}
+
+test_t_returns_id_for_unknown_message () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        effective_language="en"
+        t some.bogus.id.that.does.not.exist
+    })"
+
+    [[ "$out" == "some.bogus.id.that.does.not.exist" ]]
+}
+
+# "auto" is the only value that ever re-detects - an explicit "en"/"es" must
+# win over the system locale even if they disagree, so switching back to
+# "auto" later is the only way to follow the locale again (the whole point
+# of a distinct "auto" value instead of always resolving language eagerly).
+test_resolve_language_auto_follows_system_locale () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        language="auto"
+        LANG="es_ES.UTF-8" LC_ALL="" LC_MESSAGES="" resolve_language 2>/dev/null
+    })"
+
+    [[ "$out" == "es" ]]
+}
+
+test_resolve_language_explicit_value_overrides_system_locale () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        language="es"
+        LANG="en_US.UTF-8" LC_ALL="" LC_MESSAGES="" resolve_language
+    })"
+
+    [[ "$out" == "es" ]]
+}
+
+test_invalid_language_rejected () {
+    local rc cfg
+    cfg="$(mktemp)"
+    rc="$({
+        source "$SCRIPT_PATH"
+        config_path="$cfg"
+        load_config
+        language="fr"
+        validate_settings_soft >/dev/null 2>&1
+        printf '%s' "$?"
+    })"
+    rm -f "$cfg"
+
+    [[ "$rc" != "0" ]]
+}
+
+test_detect_system_language_from_lang_env () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        LANG="es_ES.UTF-8" LC_ALL="" LC_MESSAGES="" detect_system_language 2>/dev/null
+        printf '|'
+        LANG="fr_FR.UTF-8" LC_ALL="" LC_MESSAGES="" detect_system_language 2>/dev/null
+    })"
+
+    [[ "$out" == "es|en" ]]
+}
+
+# Regression guard for this phase's core design rule: editing a Settings
+# field must never call load_config() again mid-session. Appends a sentinel
+# entry to "enabled_profiles" after the one real load_config() call (still
+# contains "spotify_native", so validate_settings_soft still passes and the
+# edit below can't get stuck re-prompting), then asserts it survives an
+# unrelated field edit unchanged - a reload would overwrite it back to
+# whatever's actually in the file.
+test_cfg_edit_input_does_not_reload_other_state () {
+    local out cfg
+    cfg="$(mktemp)"
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        # shellcheck disable=SC2317
+        render_page () { :; }
+        # shellcheck disable=SC2317
+        gum () { case "$1" in input) printf 'newvalue' ;; *) : ;; esac; }
+        config_path="$cfg"
+        load_config
+        enabled_profiles="spotify_native zz_sentinel_extra"
+        _cfg_edit_input nulloutput_name "prompt"
+        printf '%s|%s' "$nulloutput_name" "$enabled_profiles"
+    })"
+    rm -f "$cfg"
+
+    [[ "$out" == "newvalue|spotify_native zz_sentinel_extra" ]]
+}
+
+# config_changed gates whether Welcome offers "Apply configuration change" -
+# must stay false after load_config()'s own automatic first-run module
+# seeding (not a user edit), and flip true on a real field edit.
+test_cfg_edit_input_sets_config_changed () {
+    local out cfg
+    cfg="$(mktemp)"
+    out="$({
+        source "$SCRIPT_PATH"
+        # shellcheck disable=SC2317
+        render_page () { :; }
+        # shellcheck disable=SC2317
+        gum () { case "$1" in input) printf 'newvalue' ;; *) : ;; esac; }
+        config_path="$cfg"
+        load_config
+        printf '%s|' "$config_changed"
+        _cfg_edit_input nulloutput_name "prompt"
+        printf '%s' "$config_changed"
+    })"
+    rm -f "$cfg"
+
+    [[ "$out" == "false|true" ]]
+}
+
 run_test () {
     local name="$1"
     if "$name"; then
@@ -721,8 +933,6 @@ main () {
     set -e
 
     run_test test_help_contains_long_options
-    run_test test_invalid_format_rejected
-    run_test test_invalid_scheme_rejected
     run_test test_file_path_structure_and_uniqueness
     run_test test_pause_stops_session
     run_test test_pause_before_first_play_does_not_exit
@@ -738,20 +948,21 @@ main () {
     run_test test_stop_recording_cleans_up
     run_test test_cancel_and_exit_exits_zero
     run_test test_start_recording_routing_failure_sets_recording_failed
-    run_test test_player_profile_apply_spotify_overwrites
-    run_test test_player_profile_custom_preserves_fields
+    run_test test_list_profile_modules_finds_spotify_native
+    run_test test_load_config_falls_back_to_spotify_native_when_invalid
+    run_test test_load_config_seeds_missing_profile_section
+    run_test test_save_config_preserves_inactive_module_lines
+    run_test test_enabled_profiles_always_includes_default_profile
     run_test test_status_output_relpath
-    run_test test_cfg_edit_detection_input_flips_to_custom
     run_test test_is_target_sink_app_profile_driven
-    run_test test_invalid_player_profile_rejected
+    run_test test_invalid_default_profile_rejected
     run_test test_save_config_persists_all_fields
-    run_test test_effective_log_directory_default_and_override
-    run_test test_init_session_log_respects_log_directory
+    run_test test_effective_log_file_path_default_and_override
+    run_test test_init_session_log_respects_log_file_path
     run_test test_log_level_0_writes_no_log_at_all
     run_test test_log_debug_gated_by_log_level
     run_test test_stop_current_recording_logs_duration_with_track_and_disc
     run_test test_invalid_log_level_rejected
-    run_test test_load_config_backfills_player
     run_test test_default_session_name_format
     run_test test_validate_session_name_rejects_dots_and_slash
     run_test test_dir_not_empty
@@ -761,6 +972,18 @@ main () {
     run_test test_clip_text_truncates_long_values
     run_test test_internal_wait_invalid_kind_returns_1
     run_test test_internal_wait_sink_returns_once_condition_met
+    run_test test_logname_sets_log_file_path
+    run_test test_t_returns_english_by_default
+    run_test test_t_returns_spanish_when_language_is_es
+    run_test test_t_falls_back_to_english_for_missing_spanish_translation
+    run_test test_t_gracefully_falls_back_when_language_catalog_never_loaded
+    run_test test_t_returns_id_for_unknown_message
+    run_test test_resolve_language_auto_follows_system_locale
+    run_test test_resolve_language_explicit_value_overrides_system_locale
+    run_test test_invalid_language_rejected
+    run_test test_detect_system_language_from_lang_env
+    run_test test_cfg_edit_input_does_not_reload_other_state
+    run_test test_cfg_edit_input_sets_config_changed
 
     printf '\nTests: %s passed, %s failed\n' "$pass_count" "$fail_count"
 

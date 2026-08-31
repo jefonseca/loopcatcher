@@ -51,6 +51,24 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.2.3" date="2026-08-31">
+      <description>
+        <p>Adds English/Spanish translations for the whole app and reduces
+        the CLI to --help/--version/--debug/--logname - everything else
+        (output directory, session name, codec, bitrate, filename scheme)
+        moved to Settings/the Session Name screen. Settings changes now
+        apply via a new Restart menu item instead of live-reloading.</p>
+      </description>
+    </release>
+    <release version="0.2.2" date="2026-08-31">
+      <description>
+        <p>Split the Spotify-specific logic out into a loadable profile
+        module (spotify_native), the first step towards a modular,
+        multi-player architecture. Adds a Profile menu (Change Profile /
+        Profile Settings / About Profile) and an Enabled Profiles setting.
+        Renames the log_directory config key to log_file_path.</p>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-08-30">
       <description>
         <p>Restructured the UI on top of gum, kept minimal and simple.</p>
