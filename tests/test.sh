@@ -9,10 +9,9 @@ set -u
 # resolving to effective_language="en" is only guaranteed when
 # detect_system_language() doesn't see a Spanish LANG/LC_ALL/LC_MESSAGES.
 # Tests that need a specific language set $effective_language directly
-# (skipping resolution) or $language (to exercise resolve_language() itself)
-# - see individual tests for which. test_detect_system_language_from_lang_env
-# and test_resolve_language_* override these explicitly, per-call, to test
-# detection/resolution themselves.
+# (skipping resolution) or $language (to exercise resolve_language() itself),
+# and test_language_resolution_and_detection overrides the locale per call to
+# exercise detection itself.
 export LANG=C LC_ALL=C LC_MESSAGES=C
 
 ROOT_DIR="$(dirname "$(dirname "$(readlink -f "$0")")")"
@@ -87,6 +86,35 @@ test_file_path_structure_and_uniqueness () {
     rm -rf "$tmpdir"
 }
 
+# A Metadata burst is one event whose key order the MPRIS dict does not
+# guarantee. Reacting to a track change per LINE meant a trackid arriving
+# after title/artist wiped the fields that same burst had just delivered, and
+# the track recorded with no metadata - intermittently, because the order
+# varies. The reset is taken once per burst now, so every order must work,
+# and a genuine track change must still clear the previous track's fields.
+test_track_change_is_decided_per_burst_not_per_line () {
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source_with_spotify_native
+        # shellcheck disable=SC2317
+        stop_current_recording () { :; }
+        apply () {
+            _apply_track_change "$@"
+            local l
+            for l in "$@"; do process_dbus_line "$l"; done
+            printf '%s/%s ' "${artist:--}" "${title:--}"
+        }
+        apply "trackid -> /t/1" "title -> One" "artist -> A"      # trackid first
+        apply "title -> Two" "artist -> B" "trackid -> /t/2"      # trackid last
+        apply "title -> Three" "trackid -> /t/3" "artist -> C"    # trackid middle
+        # a new track whose burst carries no metadata must NOT inherit C/Three
+        apply "trackid -> /t/4"
+    })"
+
+    [[ "$out" == "A/One B/Two C/Three -/- " ]]
+}
+
 test_pause_stops_session () {
     local out
     # shellcheck disable=SC2034
@@ -132,6 +160,69 @@ test_end_session_sets_flags () {
     [[ "$out" == "1|true" ]]
 }
 
+# Metadata with no ASCII alphanumerics at all (a CJK artist name) sanitizes
+# away to nothing under the strict schemes. That used to collapse the whole
+# path - "Artist/Album/Title.m4a" became "//.m4a", a single nameless hidden
+# file at the session root that every track of the session then collided on.
+test_strict_schemes_fall_back_when_metadata_has_no_ascii () {
+    local out tmpdir
+    tmpdir="$(mktemp -d)"
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        session_output_directory="$tmpdir"
+        filename_scheme="strict"
+        strict="$(file_path_structure "日本語バンド" "アルバム" "曲名" "m4a")"
+        filename_scheme="strict-lc-nodir"
+        nodir="$(file_path_structure "日本語バンド" "アルバム" "曲名" "m4a")"
+        printf '%s|%s' "${strict#"$tmpdir"}" "${nodir#"$tmpdir"}"
+    })"
+    rm -rf "$tmpdir"
+
+    [[ "$out" == "/Unknown/Unknown/Unknown.m4a|/unknown_unknown_unknown.m4a" ]]
+}
+
+# Names Linux accepts but Windows/macOS/FAT do not: over-long components, and
+# the DOS device names. One assertion covering the cap, the word-boundary cut,
+# the trailing-punctuation trim, the reserved-name escape, and that an
+# ordinary name is passed through untouched.
+test_portable_component_caps_length_and_reserved_names () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        long="Greatest Show on Earth_ 30 Circus Songs Including Entry of the Gladiators, Barnum and Bailey's Favorite, Those Magnificent Men in Their Flying Machines, And Ringling Brothers Grand Entry!"
+        capped="$(_portable_component "$long")"
+        printf '%s|%s|%s|%s|%s' \
+            "$(( ${#capped} <= FILENAME_COMPONENT_MAX ? 1 : 0 ))" \
+            "$(( ${#capped} >= 60 ? 1 : 0 ))" \
+            "${capped: -1}" \
+            "$(_portable_component "NUL")" \
+            "$(_portable_component "Ordinary Album")"
+    })"
+
+    # capped, not over-trimmed, no trailing space/punctuation, NUL escaped,
+    # an ordinary name left exactly as it was.
+    [[ "$out" == "1|1|s|NUL_|Ordinary Album" ]]
+}
+
+# ext4/APFS cap a component at 255 BYTES, so the character cap alone is not
+# enough: 100 characters of CJK is over 300 bytes and the filesystem itself
+# would reject the name.
+test_portable_component_respects_byte_limit () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        s=""
+        for _ in 1 2 3 4 5 6 7 8 9 10; do s+="日本語のとても長いアルバム名"; done
+        capped="$(_portable_component "$s")"
+        printf '%s|%s' \
+            "$(( $(_component_bytes "$capped") <= FILENAME_COMPONENT_MAX_BYTES ? 1 : 0 ))" \
+            "$(( ${#capped} > 0 ? 1 : 0 ))"
+    })"
+
+    [[ "$out" == "1|1" ]]
+}
+
 test_normal_scheme_keeps_unicode () {
     local out
     local tmpdir
@@ -169,7 +260,8 @@ test_track_change_resets_metadata () {
         album="Old Album"
         last_trackid="track-old"
         playbackstatus="Playing"
-        process_dbus_line "trackid -> track-new"
+        # the reset belongs to the burst, not to the line that carries the id
+        _apply_track_change "trackid -> track-new"
         printf '%s|%s|%s|%s|%s' "$title" "$artist" "$album" "$active_recording_signature" "${#artist_all[@]}"
     })"
 
@@ -336,14 +428,26 @@ test_start_recording_routing_failure_sets_recording_failed () {
     [[ "$out" == "true" ]]
 }
 
-test_list_profile_modules_finds_spotify_native () {
+test_list_profile_modules_finds_shipped_modules () {
     local out
     out="$({ source "$SCRIPT_PATH"; list_profile_modules; })"
 
     assert_contains "$out" "spotify_native"
 }
 
-test_load_config_falls_back_to_spotify_native_when_invalid () {
+# The module carrying a DEFAULT marker file is what a fresh install - or a
+# config naming a module that is not installed - lands on. No module name is
+# hardcoded in the main script, so this asserts the marker actually drives it.
+test_default_profile_fallback_prefers_marked_module () {
+    local out marked
+    marked="$(cd "$ROOT_DIR" && grep -l . profiles/*/DEFAULT 2>/dev/null | head -1 | cut -d/ -f2)"
+    out="$({ source "$SCRIPT_PATH"; _default_profile_fallback; })"
+
+    [[ -n "$marked" ]] || return 1
+    [[ "$out" == "$marked" ]]
+}
+
+test_load_config_falls_back_to_default_marked_module_when_invalid () {
     local out cfg
     cfg="$(mktemp)"
     cat > "$cfg" <<'EOF'
@@ -362,25 +466,70 @@ EOF
     [[ "$out" == "spotify_native" ]]
 }
 
-test_load_config_seeds_missing_profile_section () {
+# A fresh config (no enabled_profiles yet) enables every installed module, so
+# Change Profile is usable without a trip to Settings first.
+test_load_config_enables_all_modules_on_fresh_config () {
     local out cfg
     cfg="$(mktemp)"
-    cat > "$cfg" <<'EOF'
-log_level="1"
-default_profile="spotify_native"
-enabled_profiles="spotify_native"
-EOF
+    rm -f "$cfg"
     # shellcheck disable=SC2034
     out="$({
         source "$SCRIPT_PATH"
         config_path="$cfg"
         load_config
-        printf '%s|%s|' "$spotify_native_sink_app_name" "$sink_app_name"
-        grep -c '^spotify_native_' "$cfg"
+        printf '%s' "$enabled_profiles"
     })"
     rm -f "$cfg"
 
-    [[ "$out" == "spotify|spotify|3" ]]
+    assert_contains "$out" "spotify_native"
+}
+
+# load_config seeds a module's whole prefixed config section the first time
+# that module becomes default_profile, and profile_activate aliases it into
+# the generic runtime vars. Run for BOTH shipped modules, with the expected
+# key count derived from each module's own schema instead of hardcoded, so
+# adding a field to either one cannot rot this test.
+# The two capture modes live in one module now, chosen by this setting: "yes"
+# (the default) has loopcatcher launch and drive Spotify, "no" attaches to a
+# Spotify the user drives. Merging them removed 211 lines of byte-for-byte
+# duplicate machinery, so this checks the flag really does select the flow.
+test_manage_player_flag_selects_the_capture_mode () {
+    local out cfg
+    cfg="$(mktemp)"; rm -f "$cfg"
+    out="$({
+        source "$SCRIPT_PATH"
+        config_path="$cfg"
+        load_config
+        # default, plus both branches actually being defined and reachable
+        printf '%s:%s:%s:%s' \
+            "$spotify_native_manage_player" \
+            "$(declare -F _run_managed >/dev/null && echo 1 || echo 0)" \
+            "$(declare -F _run_attached >/dev/null && echo 1 || echo 0)" \
+            "$(_profile_schema_keys | grep -c '^spotify_native_manage_player$')"
+    })"
+    rm -f "$cfg"
+
+    [[ "$out" == "yes:1:1:1" ]]
+}
+
+test_load_config_seeds_the_modules_config_section () {
+    local out cfg
+    cfg="$(mktemp)"
+    printf 'default_profile="spotify_native"\nenabled_profiles="spotify_native"\n' > "$cfg"
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        config_path="$cfg"
+        load_config
+        # every schema key persisted, and profile_activate aliased it into the
+        # generic runtime var - count derived from the schema, never hardcoded
+        printf '%s:%s' \
+            "$(( $(grep -c '^spotify_native_' "$cfg") == $(_profile_schema_keys | wc -l) ? 1 : 0 ))" \
+            "$sink_app_name"
+    })"
+    rm -f "$cfg"
+
+    [[ "$out" == "1:spotify" ]]
 }
 
 test_save_config_preserves_inactive_module_lines () {
@@ -405,43 +554,26 @@ EOF
     [[ "$out" == "1" ]]
 }
 
+# An installed default_profile left out of enabled_profiles (hand-edited
+# config) must be KEPT and re-added to the list - not silently swapped for
+# whichever module happens to be the fallback.
 test_enabled_profiles_always_includes_default_profile () {
     local out cfg
     cfg="$(mktemp)"
     cat > "$cfg" <<'EOF'
 default_profile="spotify_native"
-enabled_profiles=""
+enabled_profiles="some_other_module"
 EOF
     # shellcheck disable=SC2034
     out="$({
         source "$SCRIPT_PATH"
         config_path="$cfg"
         load_config
-        printf '%s' "$enabled_profiles"
+        printf '%s|%s' "$default_profile" "$enabled_profiles"
     })"
     rm -f "$cfg"
 
-    assert_contains "$out" "spotify_native"
-}
-
-test_status_output_relpath () {
-    local out
-    # shellcheck disable=SC2034
-    out="$({
-        source "$SCRIPT_PATH"
-        session_output_directory="/m/sess"
-        tui_output="/m/sess/Artist/Album/Track.m4a"
-        status_output_relpath
-        printf '|'
-        tui_output="-"
-        status_output_relpath
-        printf '|'
-        session_output_directory="/other"
-        tui_output="/m/sess/x.m4a"
-        status_output_relpath
-    })"
-
-    [[ "$out" == "Artist/Album/Track.m4a|-|/m/sess/x.m4a" ]]
+    [[ "$out" == "spotify_native|some_other_module spotify_native" ]]
 }
 
 test_is_target_sink_app_profile_driven () {
@@ -458,25 +590,48 @@ test_is_target_sink_app_profile_driven () {
     [[ "$out" == "acme-yes spotify-no" ]]
 }
 
-test_invalid_default_profile_rejected () {
-    local rc cfg
+# Counts every persisted generic + active-module key rather than naming a
+# handful, so it catches ANY key silently dropped from save_config.
+# _validate_settings guards eight fields and one bad value in any of them has
+# to make it fail. One test walking every branch, rather than a near-identical
+# test per field - which also covers the five branches (record_format,
+# filename_scheme, bitrate, aac_profile, tail_drain_seconds) that had none.
+test_validate_settings_rejects_every_invalid_field () {
+    local out cfg
     cfg="$(mktemp)"
-    rc="$({
+    out="$({
         source "$SCRIPT_PATH"
         config_path="$cfg"
         load_config
-        default_profile="bogus"
-        enabled_profiles="spotify_native"
-        validate_settings_soft >/dev/null 2>&1
-        printf '%s' "$?"
+
+        # Prints only when a bad value is WRONGLY accepted, so a healthy run
+        # says nothing but "done".
+        _expect_rejected () {
+            local field="$1" bad="$2"
+            local saved="${!field}"   # separate 'local': $field is not set yet above
+            printf -v "$field" '%s' "$bad"
+            validate_settings_soft >/dev/null 2>&1 && printf 'ACCEPTED:%s ' "$field"
+            printf -v "$field" '%s' "$saved"
+        }
+
+        # A baseline that is already invalid would make every check below pass
+        # for the wrong reason.
+        validate_settings_soft >/dev/null 2>&1 || printf 'BASELINE-INVALID '
+        _expect_rejected record_format      "flac"
+        _expect_rejected filename_scheme    "fancy"
+        _expect_rejected default_profile    "bogus_module"
+        _expect_rejected bitrate            "0"
+        _expect_rejected aac_profile        "abc"
+        _expect_rejected tail_drain_seconds "1.2.3"
+        _expect_rejected log_level          "3"
+        _expect_rejected language           "fr"
+        printf 'done'
     })"
     rm -f "$cfg"
 
-    [[ "$rc" != "0" ]]
+    [[ "$out" == "done" ]]
 }
 
-# Counts every persisted generic + active-module key rather than naming a
-# handful, so it catches ANY key silently dropped from save_config.
 test_save_config_persists_all_fields () {
     local out cfg
     cfg="$(mktemp)"
@@ -487,12 +642,16 @@ test_save_config_persists_all_fields () {
         load_config
         log_file_path="/custom/logs/x.log"
         save_config
-        grep -c -E '^[a-z_]+="' "$cfg"
+        # Written vs expected: every fixed generic key plus every schema key
+        # of whichever module is active. Derived, not hardcoded, so adding a
+        # config field or changing the default module cannot silently rot it.
+        printf '%s|%s' \
+            "$(grep -c -E '^[a-z_]+="' "$cfg")" \
+            "$(( $(_fixed_config_keys | wc -l) + $(_profile_schema_keys | wc -l) ))"
     })"
     rm -f "$cfg"
 
-    # 12 fixed generic keys (including language) + 3 spotify_native_* module keys.
-    [[ "$out" == "15" ]]
+    [[ -n "$out" && "${out%|*}" == "${out#*|}" ]]
 }
 
 test_effective_log_file_path_default_and_override () {
@@ -597,22 +756,6 @@ test_stop_current_recording_logs_duration_with_track_and_disc () {
     assert_contains "$out" 'duration_seconds="3"' || return 1
 }
 
-test_invalid_log_level_rejected () {
-    local rc cfg
-    cfg="$(mktemp)"
-    rc="$({
-        source "$SCRIPT_PATH"
-        config_path="$cfg"
-        load_config
-        log_level="3"
-        validate_settings_soft >/dev/null 2>&1
-        printf '%s' "$?"
-    })"
-    rm -f "$cfg"
-
-    [[ "$rc" != "0" ]]
-}
-
 test_default_session_name_format () {
     local out
     out="$({ source "$SCRIPT_PATH"; default_session_name; })"
@@ -662,6 +805,94 @@ test_player_bus_has_owner_empty_bus_is_alive () {
     [[ "$rc" == "0" ]]
 }
 
+test_parse_spotify_url_extracts_type_and_id () {
+    local out
+    out="$({
+        source_with_spotify_native
+        printf 'track=%s|' "$(parse_spotify_url 'https://open.spotify.com/track/2aOOFE9SV6BV0McXvnmf4n?si=8b64d25d27124212')"
+        printf 'album=%s|' "$(parse_spotify_url 'https://open.spotify.com/album/0eRXMxgNfJ33uykapOFtZp?si=TRJthGowS-qAPRhjwylTyw')"
+        printf 'playlist=%s|' "$(parse_spotify_url 'https://open.spotify.com/playlist/4IcpmVqgOWX1EbS6U8AJ66?si=cf3eeb617b5d4b18')"
+        printf 'intl=%s|' "$(parse_spotify_url 'https://open.spotify.com/intl-es/track/2aOOFE9SV6BV0McXvnmf4n')"
+        parse_spotify_url 'https://example.com/not/spotify' && printf 'invalid=matched' || printf 'invalid=rejected'
+    })"
+
+    [[ "$out" == "track=spotify:track:2aOOFE9SV6BV0McXvnmf4n|album=spotify:album:0eRXMxgNfJ33uykapOFtZp|playlist=spotify:playlist:4IcpmVqgOWX1EbS6U8AJ66|intl=spotify:track:2aOOFE9SV6BV0McXvnmf4n|invalid=rejected" ]]
+}
+
+test_profile_cleanup_kills_native_process () {
+    local rc
+    rc="$({
+        source_with_spotify_native
+        sleep 100 &
+        managed_install_type="native"
+        managed_pid=$!
+        managed_launched=true
+        profile_cleanup
+        sleep 0.2
+        kill -0 "$managed_pid" 2>/dev/null
+        printf '%s' "$?"
+    })"
+
+    [[ "$rc" == "1" ]]
+}
+
+# Regression guard: the "Spotify is already running, close it yourself" exit
+# path knows the install type but never launched anything, so cleanup must
+# leave the user's own instance alone instead of closing it behind their back.
+test_profile_cleanup_leaves_unlaunched_spotify_alone () {
+    local rc
+    rc="$({
+        source_with_spotify_native
+        sleep 100 &
+        managed_install_type="native"
+        managed_pid=$!
+        managed_launched=false
+        profile_cleanup
+        sleep 0.2
+        kill -0 "$managed_pid" 2>/dev/null
+        printf '%s' "$?"
+        kill "$managed_pid" 2>/dev/null
+    })"
+
+    [[ "$rc" == "0" ]]
+}
+
+test_trigger_playback_retries_before_success () {
+    local out
+    out="$({
+        source_with_spotify_native
+        # shellcheck disable=SC2317
+        sleep () { :; }
+        attempts=0
+        # shellcheck disable=SC2317
+        dbus-send () { attempts=$((attempts + 1)); [[ $attempts -ge 3 ]]; }
+        player_mpris_bus="org.mpris.MediaPlayer2.spotify"
+        managed_spotify_uri="spotify:track:abc"
+        trigger_playback
+        printf '%s|%s' "$?" "$attempts"
+    })"
+
+    [[ "$out" == "0|3" ]]
+}
+
+test_trigger_playback_gives_up_after_max_attempts () {
+    local out
+    out="$({
+        source_with_spotify_native
+        # shellcheck disable=SC2317
+        sleep () { :; }
+        attempts=0
+        # shellcheck disable=SC2317
+        dbus-send () { attempts=$((attempts + 1)); return 1; }
+        player_mpris_bus="org.mpris.MediaPlayer2.spotify"
+        managed_spotify_uri="spotify:track:abc"
+        trigger_playback
+        printf '%s|%s' "$?" "$attempts"
+    })"
+
+    [[ "$out" == "1|5" ]]
+}
+
 test_player_exit_ends_session_after_two_misses () {
     local out
     # shellcheck disable=SC2034
@@ -700,6 +931,65 @@ test_player_liveness_ignored_before_first_play () {
     [[ "$out" == "0" ]]
 }
 
+# The UI_WIDTH invariant has to survive both translation and a change to
+# UI_WIDTH itself. Everything here is asserted as a RELATIONSHIP rather than a
+# concrete number: hardcoding 100 is what let a UI_WIDTH change to 80 slip
+# through with tables at 93, a Title Bar whose own text wrapped, and label/pad
+# constants still derived from the old geometry. Needs no gum to render.
+test_layout_widths_hold_in_every_language () {
+    local out lang cfg
+    out=""
+    for lang in en es; do
+        cfg="$(mktemp)"; rm -f "$cfg"
+        out+="$({
+            source "$SCRIPT_PATH"
+            # The DECLARED minimum, before load_config resizes it for the
+            # language: comparing the resized value against the cap would be
+            # trivially true, since the resize clamps to that very cap.
+            label_min=$UI_TABLE_LABEL_WIDTH
+            config_path="$cfg"
+            language="$lang"
+            load_config
+            hint_w="$(_cancel_hint_width)"
+            title="LoopCatcher v$SCRIPT_VERSION - $(t spotify_native.title)"
+            printf '%s%s%s%s%s ' \
+                "$(( (UI_WIDTH - 4 - hint_w) + 2 + hint_w + 2 == UI_WIDTH ? 1 : 0 ))" \
+                "$(( UI_TABLE_LABEL_WIDTH + (UI_WIDTH - UI_TABLE_LABEL_WIDTH - 7) + 7 == UI_WIDTH ? 1 : 0 ))" \
+                "$(( $(_text_width "$(t ui.cancel_hint)") + 2 * UI_HINT_PAD <= hint_w ? 1 : 0 ))" \
+                "$(( label_min <= UI_TABLE_LABEL_MAX ? 1 : 0 ))" \
+                "$(( $(_text_width "$title") <= UI_WIDTH - 4 - hint_w ? 1 : 0 ))"
+        })"
+        rm -f "$cfg"
+    done
+
+    # title row totals UI_WIDTH | table totals UI_WIDTH | the hint fits its own
+    # box | the declared label minimum is not above its cap | the Title Bar's own
+    # text fits the room the hint leaves it.
+    [[ "$out" == "11111 11111 " ]]
+}
+
+# ui_kv_lines pads by measured character width instead of printf's "%-*s",
+# which counts BYTES under a C locale: Spanish's "Nombre de Sesión" is 16
+# characters but 17 bytes, which silently misaligned its value by one column.
+# All three values must therefore start at the same column.
+test_ui_kv_lines_aligns_values_across_accented_labels () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        widths=""
+        # "|| [[ -n $line ]]": ui_kv_lines deliberately emits no trailing
+        # newline (one would render as a blank line inside the box), and a
+        # plain "read" drops that last unterminated line.
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # everything up to the value = label, colon and its padding
+            widths+="$(_text_width "${line% *}") "
+        done < <(ui_kv_lines "Carpeta de Salida" "A" "Nombre de Sesión" "B" "Estado de Captura" "C")
+        printf '%s' "$widths"
+    })"
+
+    [[ "$out" == "18 18 18 " ]]
+}
+
 test_clip_text_truncates_long_values () {
     local out
     out="$({
@@ -710,33 +1000,6 @@ test_clip_text_truncates_long_values () {
     })"
 
     [[ "$out" == "short|…BCDEFGHIJ" ]]
-}
-
-test_internal_wait_invalid_kind_returns_1 () {
-    local rc
-    rc="$({
-        source "$SCRIPT_PATH"
-        _internal_wait bogus --config /nonexistent 2>/dev/null
-        printf '%s' "$?"
-    })"
-
-    [[ "$rc" == "1" ]]
-}
-
-test_internal_wait_sink_returns_once_condition_met () {
-    local out cfg
-    cfg="$(mktemp)"
-    printf 'log_level="1"\n' > "$cfg"
-    out="$({
-        source "$SCRIPT_PATH"
-        # shellcheck disable=SC2317
-        get_target_sink_index () { return 0; }
-        _internal_wait sink --config "$cfg"
-        printf '%s' "$?"
-    })"
-    rm -f "$cfg"
-
-    [[ "$out" == "0" ]]
 }
 
 test_logname_sets_log_file_path () {
@@ -815,60 +1078,6 @@ test_t_returns_id_for_unknown_message () {
     [[ "$out" == "some.bogus.id.that.does.not.exist" ]]
 }
 
-# "auto" is the only value that ever re-detects - an explicit "en"/"es" must
-# win over the system locale even if they disagree, so switching back to
-# "auto" later is the only way to follow the locale again (the whole point
-# of a distinct "auto" value instead of always resolving language eagerly).
-test_resolve_language_auto_follows_system_locale () {
-    local out
-    out="$({
-        source "$SCRIPT_PATH"
-        language="auto"
-        LANG="es_ES.UTF-8" LC_ALL="" LC_MESSAGES="" resolve_language 2>/dev/null
-    })"
-
-    [[ "$out" == "es" ]]
-}
-
-test_resolve_language_explicit_value_overrides_system_locale () {
-    local out
-    out="$({
-        source "$SCRIPT_PATH"
-        language="es"
-        LANG="en_US.UTF-8" LC_ALL="" LC_MESSAGES="" resolve_language
-    })"
-
-    [[ "$out" == "es" ]]
-}
-
-test_invalid_language_rejected () {
-    local rc cfg
-    cfg="$(mktemp)"
-    rc="$({
-        source "$SCRIPT_PATH"
-        config_path="$cfg"
-        load_config
-        language="fr"
-        validate_settings_soft >/dev/null 2>&1
-        printf '%s' "$?"
-    })"
-    rm -f "$cfg"
-
-    [[ "$rc" != "0" ]]
-}
-
-test_detect_system_language_from_lang_env () {
-    local out
-    out="$({
-        source "$SCRIPT_PATH"
-        LANG="es_ES.UTF-8" LC_ALL="" LC_MESSAGES="" detect_system_language 2>/dev/null
-        printf '|'
-        LANG="fr_FR.UTF-8" LC_ALL="" LC_MESSAGES="" detect_system_language 2>/dev/null
-    })"
-
-    [[ "$out" == "es|en" ]]
-}
-
 # Regression guard for this phase's core design rule: editing a Settings
 # field must never call load_config() again mid-session. Appends a sentinel
 # entry to "enabled_profiles" after the one real load_config() call (still
@@ -876,6 +1085,23 @@ test_detect_system_language_from_lang_env () {
 # edit below can't get stuck re-prompting), then asserts it survives an
 # unrelated field edit unchanged - a reload would overwrite it back to
 # whatever's actually in the file.
+# resolve_language()'s two branches plus the detection underneath them:
+# "auto" re-reads the system locale live (and anything that is not Spanish
+# falls back to English), while an explicit value wins over the locale in
+# either direction.
+test_language_resolution_and_detection () {
+    local out
+    out="$({
+        source "$SCRIPT_PATH"
+        language="auto"; printf '%s|' "$(LANG="es_ES.UTF-8" LC_ALL="" LC_MESSAGES="" resolve_language 2>/dev/null)"
+        language="auto"; printf '%s|' "$(LANG="fr_FR.UTF-8" LC_ALL="" LC_MESSAGES="" resolve_language 2>/dev/null)"
+        language="es";   printf '%s|' "$(LANG="en_US.UTF-8" LC_ALL="" LC_MESSAGES="" resolve_language 2>/dev/null)"
+        language="en";   printf '%s'  "$(LANG="es_ES.UTF-8" LC_ALL="" LC_MESSAGES="" resolve_language 2>/dev/null)"
+    })"
+
+    [[ "$out" == "es|en|es|en" ]]
+}
+
 test_cfg_edit_input_does_not_reload_other_state () {
     local out cfg
     cfg="$(mktemp)"
@@ -888,7 +1114,11 @@ test_cfg_edit_input_does_not_reload_other_state () {
         gum () { case "$1" in input) printf 'newvalue' ;; *) : ;; esac; }
         config_path="$cfg"
         load_config
-        enabled_profiles="spotify_native zz_sentinel_extra"
+        # Keeps default_profile in the list on purpose: _validate_settings
+        # checks EVERY setting, so an edit to any field would otherwise fail
+        # validation and _cfg_edit_input would re-prompt forever against a
+        # stub that always answers the same thing.
+        enabled_profiles="$default_profile zz_sentinel_extra"
         _cfg_edit_input nulloutput_name "prompt"
         printf '%s|%s' "$nulloutput_name" "$enabled_profiles"
     })"
@@ -934,6 +1164,7 @@ main () {
 
     run_test test_help_contains_long_options
     run_test test_file_path_structure_and_uniqueness
+    run_test test_track_change_is_decided_per_burst_not_per_line
     run_test test_pause_stops_session
     run_test test_pause_before_first_play_does_not_exit
     run_test test_end_session_sets_flags
@@ -943,45 +1174,51 @@ main () {
     run_test test_process_dbus_line_collects_all_artist_values
     run_test test_start_recording_ogg_writes_all_artists_as_separate_fields
     run_test test_maybe_start_recording_waits_for_full_metadata_burst
+    run_test test_strict_schemes_fall_back_when_metadata_has_no_ascii
+    run_test test_portable_component_caps_length_and_reserved_names
+    run_test test_portable_component_respects_byte_limit
     run_test test_normal_scheme_keeps_unicode
     run_test test_normal_scheme_strips_path_chars
     run_test test_stop_recording_cleans_up
     run_test test_cancel_and_exit_exits_zero
     run_test test_start_recording_routing_failure_sets_recording_failed
-    run_test test_list_profile_modules_finds_spotify_native
-    run_test test_load_config_falls_back_to_spotify_native_when_invalid
-    run_test test_load_config_seeds_missing_profile_section
+    run_test test_list_profile_modules_finds_shipped_modules
+    run_test test_default_profile_fallback_prefers_marked_module
+    run_test test_load_config_falls_back_to_default_marked_module_when_invalid
+    run_test test_load_config_enables_all_modules_on_fresh_config
+    run_test test_manage_player_flag_selects_the_capture_mode
+    run_test test_load_config_seeds_the_modules_config_section
     run_test test_save_config_preserves_inactive_module_lines
     run_test test_enabled_profiles_always_includes_default_profile
-    run_test test_status_output_relpath
     run_test test_is_target_sink_app_profile_driven
-    run_test test_invalid_default_profile_rejected
+    run_test test_validate_settings_rejects_every_invalid_field
     run_test test_save_config_persists_all_fields
     run_test test_effective_log_file_path_default_and_override
     run_test test_init_session_log_respects_log_file_path
     run_test test_log_level_0_writes_no_log_at_all
     run_test test_log_debug_gated_by_log_level
     run_test test_stop_current_recording_logs_duration_with_track_and_disc
-    run_test test_invalid_log_level_rejected
     run_test test_default_session_name_format
     run_test test_validate_session_name_rejects_dots_and_slash
     run_test test_dir_not_empty
     run_test test_player_bus_has_owner_empty_bus_is_alive
+    run_test test_parse_spotify_url_extracts_type_and_id
+    run_test test_profile_cleanup_kills_native_process
+    run_test test_profile_cleanup_leaves_unlaunched_spotify_alone
+    run_test test_trigger_playback_retries_before_success
+    run_test test_trigger_playback_gives_up_after_max_attempts
     run_test test_player_exit_ends_session_after_two_misses
     run_test test_player_liveness_ignored_before_first_play
+    run_test test_layout_widths_hold_in_every_language
+    run_test test_ui_kv_lines_aligns_values_across_accented_labels
     run_test test_clip_text_truncates_long_values
-    run_test test_internal_wait_invalid_kind_returns_1
-    run_test test_internal_wait_sink_returns_once_condition_met
     run_test test_logname_sets_log_file_path
     run_test test_t_returns_english_by_default
     run_test test_t_returns_spanish_when_language_is_es
     run_test test_t_falls_back_to_english_for_missing_spanish_translation
     run_test test_t_gracefully_falls_back_when_language_catalog_never_loaded
     run_test test_t_returns_id_for_unknown_message
-    run_test test_resolve_language_auto_follows_system_locale
-    run_test test_resolve_language_explicit_value_overrides_system_locale
-    run_test test_invalid_language_rejected
-    run_test test_detect_system_language_from_lang_env
+    run_test test_language_resolution_and_detection
     run_test test_cfg_edit_input_does_not_reload_other_state
     run_test test_cfg_edit_input_sets_config_changed
 

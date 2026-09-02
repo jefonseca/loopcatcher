@@ -8,8 +8,13 @@ load a profile, ask it to do its thing, and record whatever audio the
 profile routes its way.
 
 This document is a guide for writing your own. If you'd rather learn by
-reading real code, `profiles/spotify_native/` is the one profile that ships
-today, and every example below is drawn from it.
+reading real code, one profile ships today, `profiles/spotify_native/`, and every example below
+is drawn from it.
+
+It ships both shapes a profile can take, chosen by its own `manage_player`
+setting: *driving* the player (detecting the install, launching it, starting
+playback over MPRIS, closing it at the end) or merely *attaching* to one the
+user drives. Read it whichever way you are heading.
 
 ## What a profile actually is
 
@@ -27,6 +32,7 @@ profiles/
       en.sh           # required — your strings, in English
       es.sh           # optional — your strings, in Spanish
     README.md         # required — shown to users as "About Profile"
+    DEFAULT           # optional — see "Enabling and selecting" below
 ```
 
 That's it. Drop a folder shaped like this under `profiles/` and LoopCatcher
@@ -159,14 +165,27 @@ profile_wait_condition () {
     case "$1" in
         paused)  your_player_is_paused ;;
         playing) your_player_is_playing ;;
-        *)       return 1 ;;
+        *)       return 2 ;;
     esac
 }
 ```
 
 The names you use for `kind` (here `paused`/`playing`) are entirely up to
 you — they're just the strings you'll pass to `wizard_step_screen` in
-`profile_run` below.
+`profile_run` below. LoopCatcher's internal wizard-step waiter only ever
+knows one kind by name itself (`sink`, handled generically since every
+profile needs one) — every other kind is forwarded straight to your
+`profile_wait_condition`, so you're free to name yours however makes sense.
+
+The exit code you return matters, though — it's a two-way signal, not just
+truthy/falsy:
+
+- **`0`** — the condition is met, move on.
+- **`1`** (or any code other than `0`/`2`) — this is a `kind` you do handle,
+  it's just not true yet. LoopCatcher keeps polling.
+- **`2`** — you don't recognize this `kind` at all. LoopCatcher stops
+  waiting and fails immediately instead of polling forever on a typo or a
+  kind you never implemented.
 
 ### `profile_run()`
 
@@ -255,8 +274,7 @@ routing. All of the following are already there, ready to call:
 | `start_recording artist album title albumartist tracknumber discnumber` | Starts encoding a new track; returns non-zero if it couldn't |
 | `stop_current_recording [quick\|drain]` | Stops the current recording (`quick` for a track change, `drain` when the session is ending) |
 | `end_session` | Marks the session over — LoopCatcher will show the Finish screen next |
-| `tui_set field value` | Updates one field (`track`/`artist`/`album`/`tracknumber`/`discnumber`/`output`) on the Recording screen |
-| `status_output_relpath` | The current output file's path, relative to the session folder — handy for display |
+| `tui_set field value` | Updates one field (`track`/`artist`/`album`) on the Recording screen |
 | `screen_enter` / `screen_leave` | Switches the terminal in and out of the alternate screen buffer |
 | `paint_frame text` | Repaints the Recording screen in place, without a full clear |
 | `ui_kv_table col1 col2 label val ...` | Draws one of the bordered "Field / Value" tables |
@@ -285,19 +303,33 @@ logic:
 MSG_en[your_profile_name.label]='Your Player'
 MSG_en[your_profile_name.field.sink_app_name]='Sink App Name'
 MSG_en[your_profile_name.wizard.step1_heading]='Create the Audio Sink'
-MSG_en[your_profile_name.wizard.step1_line1]='1) Open your %s'
+MSG_en[your_profile_name.wizard.step1_body]='1) Open your %s
+2) Play any track that is NOT the one you want to record'
 ```
 
 A few rules worth knowing:
+
+- **One panel, one message.** Notice that last entry spans two lines. When a
+  screen shows a block of connected text, make it *one* multi-line string
+  rather than one id per sentence. Whoever translates it then sees the whole
+  block at once, in context, and can re-flow it for their language instead of
+  guessing at a dozen disconnected fragments. Keep separate only what's
+  genuinely separate: a heading rendered as its own element, or text reused
+  on more than one screen.
+- **Keep each line at or under ~85 characters.** `gum` hard-wraps anything
+  longer, mid-sentence, which wrecks the alignment of lists and sections. The
+  exception is a single-line paragraph meant to flow (like an intro
+  sentence) — `gum` is supposed to wrap that one.
 
 - **English is the fallback.** If a translation is missing an id, LoopCatcher
   falls back to whatever `lang/en.sh` has for it — so `lang/en.sh` has to be
   complete (every id you ever call `t` with needs an entry there), but
   `lang/es.sh` and any other language don't. Add translations at your own
   pace; nothing breaks in the meantime.
-- **`%s` placeholders** work exactly like `printf` — `t your_profile_name.wizard.step1_line1 "$label"`
+- **`%s` placeholders** work exactly like `printf` — `t your_profile_name.wizard.step1_body "$label"`
   fills in `%s` with `$label`. Keep the same number of `%s` placeholders,
-  in the same order, across every language's version of the same id.
+  in the same order, across every language's version of the same id. A
+  literal percent sign in such an entry has to be written `%%`.
 - **Namespace your ids** with your profile's name (`your_profile_name.*`),
   the same way your config keys are prefixed — it keeps everything findable
   and avoids collisions with the main app's own ids or another profile's.
@@ -320,8 +352,10 @@ a terminal pager). A good one answers:
 
 ## Enabling and selecting your profile
 
-Dropping a folder under `profiles/` makes LoopCatcher aware of it, but two
-more steps make it actually usable:
+Dropping a folder under `profiles/` makes LoopCatcher aware of it. On a
+brand-new install — no config file yet — every profile it finds starts out
+enabled, so yours is immediately selectable. Once a config exists, two steps
+make a newly added profile usable:
 
 1. **Settings → Enabled Profiles** — add your profile to the list. A profile
    that isn't enabled can't be selected, even if someone tries.
@@ -329,6 +363,38 @@ more steps make it actually usable:
 
 Both of these save immediately but, like every other setting, only take
 effect after **Apply configuration change** on the Welcome menu.
+
+### The `DEFAULT` marker
+
+Which profile a *fresh* install starts on isn't hardcoded anywhere in the
+main script — it asks the installed profiles. Any profile carrying a file
+literally named `DEFAULT` in its own folder declares itself the sensible
+out-of-the-box choice, and the first one found wins. `spotify_native`
+ships one today.
+
+The same marker also decides where LoopCatcher lands if the configured
+`default_profile` names a profile that is no longer installed (uninstalled
+package, renamed folder), instead of stranding the user on a profile that
+isn't there. If nothing carries the marker, the first profile found is used.
+
+You almost certainly do **not** want to ship this marker in a third-party
+profile you're contributing — it changes what every new user starts on. It's
+here so a distribution, a fork, or a local install can express that choice
+without patching `loopcatcher` itself.
+
+### Packaging
+
+If your profile is going into the Debian package, add one line to
+`debian/install` so its folder is actually installed:
+
+```
+profiles/your_profile_name usr/share/loopcatcher/profiles/
+```
+
+That line copies the whole folder recursively, so new files inside it (an
+extra `lang/<code>.sh`, say) never need another packaging change. The CI
+workflows already glob `profiles/*/profile.sh` and `profiles/*/lang/*.sh`,
+so they pick up your profile with no edit at all.
 
 ## Testing your profile
 
@@ -365,6 +431,10 @@ targeting. There's no substitute for watching it capture a real track.
       call `t` with
 - [ ] `profiles/your_profile_name/README.md` explains what it captures, how,
       and by whom
+- [ ] No `DEFAULT` marker file, unless you really do mean to change what
+      every new install starts on
+- [ ] `debian/install` has a line for your folder, if it should ship in the
+      package
 - [ ] `bash -n` and `shellcheck` are clean
 - [ ] You've actually recorded something real with it
 
