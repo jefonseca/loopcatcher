@@ -51,6 +51,17 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.3.1" date="2026-09-02">
+      <description>
+        <p>Fixes track, album and artist names being cut off at the first
+        quote character, in both the file name and the tags. Guarantees
+        that metadata is fetched before recording starts, so a track can
+        no longer play for a whole session without anything being
+        recorded. Adds a "Metadata" heading to the Recording screen and
+        renames the Welcome screen's configuration summary to "Current
+        configuration".</p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-09-02">
       <description>
         <p>Adds a managed capture mode to the Spotify profile, on by

@@ -62,6 +62,7 @@ MSG_es[spotify_native.error.invalid_url]='Ese enlace de Spotify no es válido. I
 
 # --- Pantalla de Grabación (recording_screen_render()) ---
 MSG_es[spotify_native.recording.title]='Grabación'
+MSG_es[spotify_native.recording.metadata_heading]='Metadatos'
 MSG_es[spotify_native.field.output_folder]='Carpeta de Salida'
 MSG_es[spotify_native.field.session_name]='Nombre de Sesión'
 MSG_es[spotify_native.field.catcher_status]='Estado de Captura'

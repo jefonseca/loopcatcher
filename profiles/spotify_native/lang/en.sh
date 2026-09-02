@@ -71,6 +71,7 @@ MSG_en[spotify_native.error.invalid_url]="That is not a valid Spotify link. Plea
 
 # --- Recording screen (recording_screen_render()) ---
 MSG_en[spotify_native.recording.title]='Recording'
+MSG_en[spotify_native.recording.metadata_heading]='Metadata'
 MSG_en[spotify_native.field.output_folder]='Output Folder'
 MSG_en[spotify_native.field.session_name]='Session Name'
 MSG_en[spotify_native.field.catcher_status]='Catcher Status'

@@ -193,6 +193,31 @@ _playback_is_stopped () {
     [[ "$(player_playback_status)" != "Playing" ]]
 }
 
+# Actively queries the player's current MPRIS Metadata and emits it as the same
+# "key -> value" lines the coproc produces. This is the recovery path for a
+# PropertiesChanged burst that was missed (emitted before the coproc attached)
+# or that announced "Playing" without carrying any metadata: without a title
+# and artist there is no filename, so recording must never start blind.
+_query_metadata_kv () {
+    local line expect_key="" expect_type=""
+    while IFS= read -r line; do
+        _mpris_parse_line "$line" expect_key expect_type
+    done < <(dbus-send --print-reply --dest="$player_mpris_bus" /org/mpris/MediaPlayer2 \
+                org.freedesktop.DBus.Properties.Get \
+                string:org.mpris.MediaPlayer2.Player string:Metadata 2>/dev/null)
+}
+
+# Applies a freshly-queried Metadata snapshot into the same globals the coproc
+# feeds, so maybe_start_recording can proceed exactly as if the burst had been
+# received live. Only ever called while nothing is recording and the fields are
+# empty, so it never fights the live stream.
+query_current_metadata () {
+    local kv
+    while IFS= read -r kv; do
+        process_dbus_line "$kv"
+    done < <(_query_metadata_kv)
+}
+
 ###############################################################################
 # Install detection / launch / URL parsing / playback trigger
 ###############################################################################
@@ -373,8 +398,61 @@ url_input_screen () {
 }
 
 ###############################################################################
-# MPRIS monitor (player-scoped) - copied verbatim from spotify_native
+# MPRIS monitor (player-scoped)
 ###############################################################################
+
+# Extracts the value of a dbus-monitor `string "..."` line. A field split on
+# the `"` delimiter (`cut -d '"' -f2`) truncates any value that itself contains
+# a quote - e.g. a title like `Always with Me (From "Spirited Away")` was cut
+# to `Always with Me (From`. dbus-monitor does not escape embedded quotes, so
+# instead take everything between the FIRST `string "` and the LAST `"` on the
+# line - the only two quotes guaranteed to be delimiters.
+_dbus_string_value () {
+    local v="${1#*string \"}"   # drop up to and including the opening: string "
+    printf '%s' "${v%\"*}"      # drop the trailing closing quote
+}
+
+# Parses ONE line of MPRIS property output, carrying the "which key/type are we
+# inside" state across calls in the caller's own $2/$3 variables (by name). It
+# emits a "key -> value" line when a full value is seen. The exact same format
+# is produced by dbus-monitor's PropertiesChanged stream AND by a one-shot
+# `dbus-send ... Properties.Get Metadata` reply, so both parse through here.
+_mpris_parse_line () {
+    local line="$1"
+    local -n _ek="$2" _et="$3"
+
+    case "$line" in
+        *'string "PlaybackStatus"'*)     _ek="playbackstatus"; _et="string";       return ;;
+        *'string "mpris:trackid"'*)      _ek="trackid";        _et="string";       return ;;
+        *'string "xesam:album"'*)        _ek="album";          _et="string";       return ;;
+        *'string "xesam:albumArtist"'*)  _ek="albumartist";    _et="string";       return ;;
+        *'string "xesam:artist"'*)       _ek="artist";         _et="string_array"; return ;;
+        *'string "xesam:discNumber"'*)   _ek="discnumber";     _et="int32";        return ;;
+        *'string "xesam:title"'*)        _ek="title";          _et="string";       return ;;
+        *'string "xesam:trackNumber"'*)  _ek="tracknumber";    _et="int32";        return ;;
+    esac
+
+    [[ -z "$_ek" ]] && return
+
+    if [[ "$_et" == "string" ]] && [[ $line == *'string "'* ]]; then
+        printf '%s -> %s\n' "$_ek" "$(_dbus_string_value "$line")"
+        _ek=""; _et=""
+    elif [[ "$_et" == "string_array" ]] && [[ $line == *']'* ]]; then
+        # End of the "xesam:artist" array (a bare "]" line) - stop
+        # matching further elements, without emitting a bogus one.
+        _ek=""; _et=""
+    elif [[ "$_et" == "string_array" ]] && [[ $line == *'string "'* ]]; then
+        # One element of the "xesam:artist" array - unlike a scalar
+        # "string" field, do NOT clear the state here, so every remaining
+        # element up to the closing "]" is also emitted under "artist".
+        printf '%s -> %s\n' "$_ek" "$(_dbus_string_value "$line")"
+    elif [[ "$_et" == "int32" ]] && [[ $line == *'int32 '* ]]; then
+        # Value sits after the LAST "int32 " token, not at a fixed
+        # field position - the "variant" prefix column width varies.
+        printf '%s -> %s\n' "$_ek" "${line##*int32 }"
+        _ek=""; _et=""
+    fi
+}
 
 # Runs as a coproc. Emits "key -> value" lines parsed by process_dbus_line.
 # If the player-scoped match rule is rejected, retries once unscoped.
@@ -385,40 +463,10 @@ get_dbusmessages () {
 
     while :; do
         attempt=$((attempt + 1))
+        expect_key=""; expect_type=""
         while IFS= read -r line; do
             started=1
-            case "$line" in
-                *'string "PlaybackStatus"'*)     expect_key="playbackstatus"; expect_type="string"; continue ;;
-                *'string "mpris:trackid"'*)      expect_key="trackid";        expect_type="string"; continue ;;
-                *'string "xesam:album"'*)        expect_key="album";          expect_type="string"; continue ;;
-                *'string "xesam:albumArtist"'*)  expect_key="albumartist";    expect_type="string";       continue ;;
-                *'string "xesam:artist"'*)       expect_key="artist";         expect_type="string_array";  continue ;;
-                *'string "xesam:discNumber"'*)   expect_key="discnumber";     expect_type="int32";  continue ;;
-                *'string "xesam:title"'*)        expect_key="title";          expect_type="string"; continue ;;
-                *'string "xesam:trackNumber"'*)  expect_key="tracknumber";    expect_type="int32";  continue ;;
-            esac
-
-            [[ -z "$expect_key" ]] && continue
-
-            if [[ "$expect_type" == "string" ]] && [[ $line == *'string "'* ]]; then
-                printf '%s -> %s\n' "$expect_key" "$(cut -d '"' -f2 <<< "$line")"
-                expect_key=""; expect_type=""
-            elif [[ "$expect_type" == "string_array" ]] && [[ $line == *']'* ]]; then
-                # End of the "xesam:artist" array (a bare "]" line) - stop
-                # matching further elements, without emitting a bogus one.
-                expect_key=""; expect_type=""
-            elif [[ "$expect_type" == "string_array" ]] && [[ $line == *'string "'* ]]; then
-                # One element of the "xesam:artist" array - unlike a scalar
-                # "string" field, do NOT clear expect_key/expect_type here,
-                # so every remaining element up to the closing "]" is also
-                # emitted under the same "artist" key.
-                printf '%s -> %s\n' "$expect_key" "$(cut -d '"' -f2 <<< "$line")"
-            elif [[ "$expect_type" == "int32" ]] && [[ $line == *'int32 '* ]]; then
-                # Value sits after the LAST "int32 " token, not at a fixed
-                # field position - the "variant" prefix column width varies.
-                printf '%s -> %s\n' "$expect_key" "${line##*int32 }"
-                expect_key=""; expect_type=""
-            fi
+            _mpris_parse_line "$line" expect_key expect_type
         done < <(dbus-monitor "$rule" 2>/dev/null)
 
         # dbus-monitor exited with no output at all -> the rule was rejected.
@@ -458,6 +506,11 @@ maybe_start_recording () {
     local signature
 
     [[ "$playbackstatus" != "Playing" ]] && return
+
+    # There is no filename without metadata, so a missed/empty burst must not be
+    # silently accepted: query the player directly before giving up. If it still
+    # yields nothing (e.g. between tracks), stay idle and let the next tick retry.
+    [[ -z "$title" || -z "$artist" ]] && query_current_metadata
     [[ -z "$title" || -z "$artist" ]] && return
 
     signature="${trackid:-$artist|$album|$title}"
@@ -465,6 +518,10 @@ maybe_start_recording () {
 
     if start_recording "$artist" "$album" "$title" "$albumartist" "$tracknumber" "$discnumber"; then
         active_recording_signature="$signature"
+        # Keep track-change detection in sync with a recording started from a
+        # recovered (not live-streamed) burst, so a later refresh of the SAME
+        # track does not read as a change and needlessly split the file.
+        [[ -n "$trackid" ]] && last_trackid="$trackid"
     fi
 }
 
@@ -526,8 +583,7 @@ join_artist_list () {
 }
 
 ###############################################################################
-# Recording screen - copied from spotify_native, plus one extra Info row
-# showing which install type (native/flatpak/snap) is currently running.
+# Recording screen
 ###############################################################################
 
 recording_screen_render () {
@@ -550,8 +606,11 @@ recording_screen_render () {
         "$(t spotify_native.field.album)" "$(clip_text "${tui_album:--}")" \
         "$(t spotify_native.field.track)" "$(clip_text "${tui_track:--}")")"
 
-    printf -v frame '%s\n%s\n%s\n' \
-        "$(ui_title_row "$(t spotify_native.recording.title)")" "$info" "$meta"
+    local meta_heading
+    meta_heading="$(ui_subtitle "$(t spotify_native.recording.metadata_heading)" "$UI_WIDTH")"
+
+    printf -v frame '%s\n%s\n%s\n%s\n' \
+        "$(ui_title_row "$(t spotify_native.recording.title)")" "$info" "$meta_heading" "$meta"
 
     paint_frame "$frame"
     ui_gap
@@ -596,6 +655,15 @@ recording_main_loop () {
         if [[ $should_exit -eq 0 && $(( SECONDS - last_liveness )) -ge 1 ]]; then
             last_liveness=$SECONDS
             poll_player_liveness
+            # Recover a missed Metadata burst: if playback is running but nothing
+            # is recording yet, the "Playing" signal arrived without usable
+            # metadata (or its burst never reached us). maybe_start_recording
+            # then queries the player directly. Throttled to this 1s tick and
+            # gated on an empty signature, so it stops the instant recording
+            # begins and never floods dbus.
+            if [[ $should_exit -eq 0 && "$playbackstatus" == "Playing" && -z "$active_recording_signature" ]]; then
+                maybe_start_recording
+            fi
         fi
 
         # The frame is only recomposed when something changed - composing it

@@ -292,6 +292,29 @@ EOF
     [[ "$out" == "$(printf 'discnumber -> 1\ntracknumber -> 3')" ]]
 }
 
+test_get_dbusmessages_preserves_embedded_quotes_in_string_values () {
+    # dbus-monitor does not escape quotes inside a string value, so a field
+    # split on `"` truncated a title like `Always with Me (From "Spirited
+    # Away")` to `Always with Me (From`. The value must survive intact.
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source_with_spotify_native
+        # shellcheck disable=SC2317
+        dbus-monitor () {
+            cat <<'EOF'
+   dict entry(
+      string "xesam:title"
+      variant             string "Always with Me (From "Spirited Away") [Piano Version]"
+   )
+EOF
+        }
+        get_dbusmessages "unused-rule"
+    })"
+
+    [[ "$out" == 'title -> Always with Me (From "Spirited Away") [Piano Version]' ]]
+}
+
 test_get_dbusmessages_parses_multiple_artist_values () {
     local out
     # shellcheck disable=SC2034
@@ -377,6 +400,44 @@ test_maybe_start_recording_waits_for_full_metadata_burst () {
     })"
 
     [[ "$out" == "Metallica|S&M|The Ecstasy Of Gold||5|2" ]]
+}
+
+test_maybe_start_recording_queries_metadata_when_burst_missed () {
+    # "Playing" arrived but no Metadata burst reached the coproc, so title and
+    # artist are empty. maybe_start_recording must actively query the player
+    # (dbus-send) and start from that snapshot rather than stay idle forever.
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source_with_spotify_native
+        # shellcheck disable=SC2317
+        start_recording () { printf '%s|%s|%s|%s|%s|%s' "$1" "$2" "$3" "$4" "$5" "$6"; return 0; }
+        # shellcheck disable=SC2317
+        dbus-send () {
+            cat <<'EOF'
+   variant       array [
+         dict entry(
+            string "mpris:trackid"
+            variant                string "track-q"
+         )
+         dict entry(
+            string "xesam:title"
+            variant                string "Merry-Go-Round of Life (From "Howl's Moving Castle")"
+         )
+         dict entry(
+            string "xesam:artist"
+            variant                array [
+                  string "Joe Hisaishi"
+               ]
+         )
+      ]
+EOF
+        }
+        playbackstatus="Playing"
+        maybe_start_recording
+    })"
+
+    [[ "$out" == 'Joe Hisaishi||Merry-Go-Round of Life (From "Howl'"'"'s Moving Castle")|||' ]]
 }
 
 test_stop_recording_cleans_up () {
@@ -1170,6 +1231,8 @@ main () {
     run_test test_end_session_sets_flags
     run_test test_track_change_resets_metadata
     run_test test_get_dbusmessages_parses_int32_values
+    run_test test_get_dbusmessages_preserves_embedded_quotes_in_string_values
+    run_test test_maybe_start_recording_queries_metadata_when_burst_missed
     run_test test_get_dbusmessages_parses_multiple_artist_values
     run_test test_process_dbus_line_collects_all_artist_values
     run_test test_start_recording_ogg_writes_all_artists_as_separate_fields
