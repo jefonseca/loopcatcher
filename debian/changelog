@@ -1,3 +1,21 @@
+loopcatcher (0.3.1-1) unstable; urgency=medium
+
+  * Fix track, album and artist names being cut off at the first quote
+    character - a titles was truncated both in the file name and in
+    the tags and on-screen metadata. The MPRIS value is now read whole.
+  * Guarantee metadata is available before recording starts: when the
+    player announces playback without a usable metadata update (or its
+    update never reaches the monitor), loopcatcher now queries the player
+    directly instead of sitting idle - previously a track could play for
+    a whole session while nothing was ever recorded, because there was no
+    name to give the file.
+  * Add a "Metadata" heading above the track table on the Recording
+    screen.
+  * Rename the Welcome screen's configuration summary heading to "Current
+    configuration".
+
+ -- Kike Fonseca <filipok@gmail.com>  Wed, 02 Sep 2026 14:00:00 +0000
+
 loopcatcher (0.3.0-1) unstable; urgency=medium
 
   * Add a managed capture mode to the Spotify profile ("Manage Spotify",

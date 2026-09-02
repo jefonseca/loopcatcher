@@ -77,7 +77,7 @@ declare -gA MSG_es=(
 
     # --- Welcome / main menu ---
     [welcome.title]='Bienvenida'
-    [welcome.config_heading]='Configuración'
+    [welcome.config_heading]='Configuración actual'
     [welcome.field.codec]='Códec'
     [welcome.field.aac_profile]='Perfil AAC'
     [welcome.field.bitrate]='Bitrate'
