@@ -51,6 +51,19 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.3.0" date="2026-09-02">
+      <description>
+        <p>Adds a managed capture mode to the Spotify profile, on by
+        default: it detects a native, Flatpak or Snap install, launches
+        Spotify already routed into the capture sink, plays the track,
+        album or playlist link you paste, and closes it again when the
+        session ends. Switching it off keeps the previous flow of opening
+        and cueing Spotify yourself. Also fixes Ctrl+C not stopping an
+        in-progress recording, occasional missing metadata on a
+        session's first track, and narrows the interface to fit a
+        standard 80-column terminal.</p>
+      </description>
+    </release>
     <release version="0.2.3" date="2026-08-31">
       <description>
         <p>Adds English/Spanish translations for the whole app and reduces

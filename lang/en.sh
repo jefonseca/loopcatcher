@@ -19,18 +19,33 @@
 #   - A profile module's own README.md (About Profile): the author's free-form
 #     doc, shown verbatim, single-language.
 #
-# Strings that belong to the spotify_native module's SCREENS (Recording
-# Wizard step text, Recording screen table/labels) live here too, under the
-# spotify_native.* namespace - screens are rendered with this script's
-# generic elements even when a module drives them, so they're catalogued
-# alongside the rest of the app rather than in the module's own lang/
-# (which is reserved for the module's own IDENTITY data: its friendly label
-# and its Profile Settings field labels - see profiles/spotify_native/lang/).
+# A profile module's own on-screen strings (Wizard step text, Recording
+# screen table/field labels, ...) do NOT live here, even though screens are
+# rendered with this script's generic elements - they live in that module's
+# own profiles/<name>/lang/ instead (see profiles/spotify_native/lang/ for
+# the shipped example), so removing a module's directory removes 100% of its
+# strings with it, nothing orphaned here. load_lang_dir() merges a module's
+# lang/ into these same MSG_en/MSG_es arrays once that module is loaded (see
+# load_profile_module() in loopcatcher), so t() finds either kind of id the
+# same way regardless of which file actually declared it.
 #
 # Every entry is a plain string, used either as-is ("$(t some.id)") or as a
 # printf format consumed with extra args ("$(t some.id "$value")"). Keep %s
 # placeholder COUNT AND ORDER identical to every other language's entry for
 # the same id - t() passes the same argument list to whichever one it picks.
+# A literal percent sign in an entry that takes args must be written "%%".
+#
+# ONE PANEL, ONE MESSAGE. Where a screen shows a block of connected text, it
+# is a single MULTI-LINE entry (a plain single-quoted string spanning several
+# lines), not one id per sentence - so a translator reads it, and rewrites
+# it, as the connected text it actually is, and is free to re-flow, merge or
+# split lines to suit their language. Two rules for those entries:
+#   - DO NOT hand-wrap a sentence to fit the box. gum wraps text well, and a
+#     translation that has to be re-measured and re-broken by hand every time
+#     the layout or the wording moves is not maintainable. Write a sentence as
+#     one line however long it is.
+#   - Use a newline only where it MEANS something: one per list item, and a
+#     blank line where you want a blank line on screen.
 #
 # The "-g" on "declare -gA" below is load-bearing, not decoration: this file
 # is sourced from inside a function (load_lang_dir(), in loopcatcher) rather
@@ -49,7 +64,8 @@ declare -gA MSG_en=(
     [err.requires_tty]='%s requires an interactive terminal.'
 
     # --- generic UI chrome ---
-    [ui.cancel_hint]='Press Ctrl+C to cancel and exit.'
+    [ui.cancel_hint]='Ctrl+C to cancel'
+    [ui.catching]='Catching...'
     [ui.cancelled]='Cancelled.'
     [common.back]='< Back'
     [common.press_any_key_continue]='Press any key to continue.'
@@ -60,11 +76,11 @@ declare -gA MSG_en=(
     [err.cannot_create_config_dir]='cannot create config directory: %s'
     [warn.config_mktemp_failed]='could not write config (mktemp failed in %s)'
     [err.invalid_record_format]='Invalid record_format: %s (allowed: aac, ogg)'
-    [err.invalid_filename_scheme]='Invalid filename_scheme: %s (allowed: normal, strict, strict-lc-nodir)'
-    [err.invalid_default_profile]='Invalid default_profile: %s (not found under profiles/, or not in enabled_profiles)'
+    [err.invalid_filename_scheme]='Invalid filename_scheme: %s (normal, strict, strict-lc-nodir)'
+    [err.invalid_default_profile]='Invalid default_profile: %s (not installed, or not enabled)'
     [err.invalid_bitrate]='Invalid bitrate: %s (must be a positive integer)'
     [err.invalid_aac_profile]='Invalid aac_profile: %s (must be a positive integer)'
-    [err.invalid_tail_drain_seconds]='Invalid tail_drain_seconds: %s (must be a non-negative number, e.g. 0.35)'
+    [err.invalid_tail_drain_seconds]='Invalid tail_drain_seconds: %s (non-negative number, e.g. 0.35)'
     [err.invalid_log_level]='Invalid log_level: %s (allowed: 0, 1, 2)'
     [err.invalid_language]='Invalid language: %s (allowed: auto, en, es)'
     [err.profile_module_not_found]='profile module not found: %s (%s)'
@@ -84,7 +100,6 @@ declare -gA MSG_en=(
 
     # --- Welcome / main menu ---
     [welcome.title]='Welcome'
-    [welcome.message]='Welcome to LoopCatcher. It captures loopback audio from your desktop media player into organized, auto-tagged audio files, ready to use with the configuration below.'
     [welcome.config_heading]='Configuration'
     [welcome.field.codec]='Codec'
     [welcome.field.aac_profile]='AAC Profile'
@@ -111,16 +126,22 @@ declare -gA MSG_en=(
 
     # --- About (app-level) ---
     [about.title]='About'
-    [about.app_line]='LoopCatcher v%s'
-    [about.description]='A Linux TUI that captures desktop media player loopback audio into organized, auto-tagged audio files.'
-    [about.license]='License: MIT'
-    [about.homepage]='Homepage: https://github.com/jefonseca/loopcatcher'
+    # %s is the app version. One panel, one message - see the note at the top.
+    [about.body]='LoopCatcher v%s
+
+A Linux TUI that captures desktop media player loopback audio into organized, auto-tagged audio files.
+
+License: MIT
+Homepage: https://github.com/jefonseca/loopcatcher'
 
     # --- Configuration / Settings ---
     [config.title]='Configuration'
-    [config.notify.autosave]='Every option below is saved automatically as soon as you change it'
-    [config.notify.requires_apply]='Changes only take effect once you pick "Apply configuration change" from the Welcome menu'
-    [config.notify.edit_directly]='You can also edit the config file directly:'
+    # %s is the config file path.
+    [config.notify.body]='Every option below is saved automatically as soon as you change it
+Changes apply once you pick "Apply configuration change" from the Welcome menu
+You can also edit the config file directly:
+
+%s'
     [config.header]='Select a group'
     [config.group.codecs]='Codecs'
     [config.group.paths]='Paths'
@@ -183,8 +204,8 @@ Behavior:
   - Session name is asked interactively (prefilled with a timestamp; just
     press Enter).
   - Output goes to: output-directory/session-name
-  - The Recording Wizard walks you through creating the audio sink, pausing,
-    then starting playback to begin recording automatically.
+  - The Recording Wizard walks you through whatever steps your selected
+    player profile needs before recording starts automatically.
   - The session ends automatically when playback pauses, stops, or the
     player quits.
 
@@ -195,33 +216,4 @@ Options:
   --version                 Show version'
     [cli.unknown_argument]='Unknown argument: %s'
     [cli.version_line]='loopcatcher version %s'
-
-    # --- spotify_native module screens (Wizard steps + Recording screen) ---
-    [spotify_native.wizard.step1_heading]='Create the Audio Sink'
-    [spotify_native.wizard.step1_line1]='1) Open your %s'
-    [spotify_native.wizard.step1_line2]='2) Play any track that is NOT the first in your playlist or album you want to record'
-    [spotify_native.wizard.step2_heading]='Prepare to record'
-    [spotify_native.wizard.step2_line1]='1) Pause the playback on your %s'
-    [spotify_native.wizard.step3_heading]='Start recording'
-    [spotify_native.wizard.step3_line1]='1) Play the first track of your playlist or album to start the recording automatically'
-    [spotify_native.recording.title]='Recording'
-    [spotify_native.table.info]='Info'
-    [spotify_native.table.metadata]='Metadata'
-    [spotify_native.table.status]='Status'
-    [spotify_native.field.output_folder]='Output Folder'
-    [spotify_native.field.session_name]='Session Name'
-    [spotify_native.field.config_file]='Config File'
-    [spotify_native.field.audio_sink]='Audio Sink'
-    [spotify_native.field.artist]='Artist'
-    [spotify_native.field.album]='Album'
-    [spotify_native.field.track]='Track'
-    [spotify_native.field.track_no]='Track No.'
-    [spotify_native.field.disc_no]='Disc No.'
-    [spotify_native.field.output_file]='Output File'
-    [spotify_native.field.catcher_status]='Catcher Status'
-    [spotify_native.field.playback_status]='Playback Status'
-    [spotify_native.status.recording]='Recording'
-    [spotify_native.status.failed]='Failed'
-    [spotify_native.status.spinner_suffix]='%s...'
-    [spotify_native.error.dbus_monitor_ended]='loopcatcher: dbus-monitor ended, session stopped.'
 )

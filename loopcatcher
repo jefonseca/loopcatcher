@@ -2,9 +2,10 @@
 ###############################################################################
 # loopcatcher - record app/system loopback audio to AAC or OGG files.
 #
-# Flow: Welcome (main menu) -> Session Name -> Recording Wizard (3 steps)
-#       -> Recording screen -> Finish. The session ends automatically when
-#       playback pauses, stops, or the player quits.
+# Flow: Welcome (main menu) -> Session Name -> Recording Wizard (steps
+#       defined by the active profile module) -> Recording screen -> Finish.
+#       The session ends automatically when playback pauses, stops, or the
+#       player quits.
 #
 # The Welcome/Settings/Session Name/Finish screens and the encoding/output
 # engine below are fixed and profile-independent. Everything about detecting
@@ -39,7 +40,7 @@ fi
 # every constant below already subtracts that border (and, where present,
 # margin) so the box/table/row's ACTUAL rendered footprint is exactly
 # UI_WIDTH. Never pass UI_WIDTH straight to --width on a bordered element.
-UI_WIDTH=100
+UI_WIDTH=80
 
 # Cursor/prompt marker used on every interactive gum widget in the app: the
 # --cursor on every "gum choose", the --prompt on every "gum input", and (new)
@@ -50,10 +51,18 @@ UI_CURSOR="👉 "
 # (border adds 2) - used by ui_box, and by ui_title() when shown alone
 # (border 2, no margin: UI_WIDTH - 2).
 UI_BOX_CONTENT_WIDTH=$((UI_WIDTH - 2))
-# Usable text width inside a Normal element, e.g. ui_subtitle nested in a
-# Wizard step (ui_box's own border 2 already removed above; its padding
-# "1 10" removes 20 more).
-UI_INNER_WIDTH=$((UI_BOX_CONTENT_WIDTH - 20))
+# Horizontal padding each element puts inside its own border, one value per
+# side. Named rather than written straight into the gum flags because
+# UI_INNER_WIDTH below is derived from UI_BOX_PAD: when the two drifted apart
+# (padding went "1 5" -> "0 1" while this still subtracted the old 20),
+# ui_subtitle kept centring inside a 58-column box that was really 76 wide,
+# putting every centred heading nine columns left of centre.
+UI_BOX_PAD=1
+UI_NOTIFY_PAD=5
+
+# Usable text width inside a Normal element - what ui_subtitle centres in when
+# nested in one, and the budget a catalog line has before gum wraps it.
+UI_INNER_WIDTH=$((UI_BOX_CONTENT_WIDTH - 2 * UI_BOX_PAD))
 
 # Column widths for every "Field / Value" gum table (ui_kv_table). gum table's
 # own --widths flag has no effect in --print (static) mode - confirmed by
@@ -62,15 +71,32 @@ UI_INNER_WIDTH=$((UI_BOX_CONTENT_WIDTH - 20))
 # empirically: a 2-column "gum table --border rounded" then renders at exactly
 # label + value + 7 columns wide (borders + separator + each cell's own
 # leading/trailing space), so this makes the whole table exactly UI_WIDTH.
+# UI_TABLE_LABEL_WIDTH is a MINIMUM, not a fixed size. A language whose
+# labels run longer widens the column instead of pushing the whole table past
+# UI_WIDTH (_compute_table_label_width does the sizing) - Spanish's "Perfil de
+# Reproductor" is 21 columns where English's "Player Profile" is 14.
+#
+# UI_TABLE_LABEL_MAX is where the widening stops, expressed as a share of
+# UI_WIDTH so it survives a change to it: a third, leaving the value column
+# the bulk of the row. Never below the minimum - deriving this from a fixed
+# value-column size instead (it used to be "UI_WIDTH - 7 - 65") silently
+# turned the cap into 8 when UI_WIDTH went 100 -> 80, i.e. a maximum BELOW
+# the minimum, which collapsed the label column and pushed tables to 93.
 UI_TABLE_LABEL_WIDTH=18
-UI_TABLE_VALUE_WIDTH=$((UI_WIDTH - UI_TABLE_LABEL_WIDTH - 7))
+UI_TABLE_LABEL_MAX=$(( UI_WIDTH / 3 > UI_TABLE_LABEL_WIDTH ? UI_WIDTH / 3 : UI_TABLE_LABEL_WIDTH ))
 
 # The Cancel hint sits to the right of the Title Bar (see ui_title_row), each
-# in its own bordered box (+2 each, so -4 total). Its column is a fixed
-# content width; the Title Bar box takes what's left, so the joined row is
-# exactly UI_WIDTH wide.
-UI_HINT_WIDTH=36
-UI_TITLE_ROW_WIDTH=$((UI_WIDTH - 4 - UI_HINT_WIDTH))
+# in its own bordered box (+2 each, so -4 total); the Title Bar box takes
+# whatever the hint leaves, so the joined row is exactly UI_WIDTH wide.
+#
+# Like UI_TABLE_LABEL_WIDTH above, a MINIMUM rather than a fixed size:
+# ui_title_row widens this column when the active language's own string needs
+# it and narrows the Title Bar by the same amount. Kept as a share of
+# UI_WIDTH: a fixed 36 was a quarter of the row at UI_WIDTH=100 but nearly
+# half of it at 80, squeezing the Title Bar until Spanish's own title wrapped
+# onto a second line.
+UI_HINT_PAD=1
+UI_HINT_WIDTH=$(( UI_WIDTH / 4 ))
 
 # Notification content width: same as a Normal element (border 2, no
 # horizontal margin) so it lines up with every other element's total width.
@@ -207,8 +233,12 @@ load_lang_dir "$(lang_root)"
 # --- persisted to the config file ---
 # 0 = no log written at all, 1 = normal session log, 2 = adds encoder diagnostics.
 log_level="0"
-# Directory name (under profiles/) of the active profile module.
-default_profile="spotify_native"
+# Directory name (under profiles/) of the active profile module. Left empty
+# here on purpose (set -u still needs SOME value): profiles_root()/
+# list_profile_modules() - which pick the real fallback - aren't callable
+# yet this early in the file's top-to-bottom execution, only load_config()
+# (which runs later, once every function is defined) can do that.
+default_profile=""
 # Space-separated module directory names allowed to be used anywhere.
 # default_profile's own module is always implicitly included.
 enabled_profiles=""
@@ -243,15 +273,11 @@ config_changed=false
 
 # --- live status view ---
 status_dirty=0             # main loop repaints once per tick only when this is set
-_spinner_pid=""             # backgrounded "gum spin" decorating the Recording screen
 recording_failed=false     # Catcher Status: false -> "Recording", true -> "Failed"
 session_ended=false        # set by end_session(); tells main() to show the Finish screen
 tui_track="-"
 tui_artist="-"
 tui_album="-"
-tui_tracknumber="-"
-tui_discnumber="-"
-tui_output="-"
 
 # --- session ---
 session_name=""
@@ -364,10 +390,12 @@ check_encoder_dependency () {
 #   Cancel hint   -> ui_cancel_hint ()  bold text, never inside a bordered box
 #                                        (it sits beside the Title Bar, not in
 #                                        it - see ui_title_row)
-#   Spinner       -> real "gum spin" calls in wizard_step_screen() (Recording
-#                    Wizard steps) and profiles/*/profile.sh's
-#                    recording_screen_render() - the --spinner flag picks the
-#                    animation there
+#   Spinner       -> real "gum spin" calls, ALWAYS in the foreground, in
+#                    wizard_step_screen() and the modules' own waits. Never
+#                    backgrounded: a gum widget running alongside the script
+#                    owns /dev/tty in raw mode, which both swallows Ctrl+C and
+#                    fights the script for the screen (see the Recording
+#                    screen note further down)
 #   Table         -> ui_kv_table ()     "Field / Value" rows, a real "gum
 #                                        table" (rounded border) - the
 #                                        standard way this app shows any list
@@ -386,7 +414,7 @@ check_encoder_dependency () {
 #
 # ui_subtitle (bold, centred heading - nested inside a Normal element, e.g. a
 # Wizard step, or standalone above a Table, e.g. Welcome) and the shared table
-# column widths (UI_TABLE_LABEL_WIDTH / UI_TABLE_VALUE_WIDTH, above) live here
+# column widths (UI_TABLE_LABEL_WIDTH / UI_TABLE_LABEL_MAX, above) live here
 # too. "gum filter" (Change Profile, see the Welcome/Profile screens further
 # down) is this app's only other interactive selection widget besides "gum
 # choose" - used there, and only there, because the profile list is meant to
@@ -410,13 +438,13 @@ ui_clear () {
 # width.
 ui_title () {
     local width="${2:-$UI_BOX_CONTENT_WIDTH}"
-    gum style --width "$width" --margin "1 0" --padding "1 1" --border normal --align center --bold -- \
+    gum style --width "$width" --margin "0 0" --padding "0 0" --border normal --align center --bold -- \
         "LoopCatcher v$SCRIPT_VERSION - $1"
 }
 
 # "Tipo normal" element.
 ui_box () {
-    gum style --width "$UI_BOX_CONTENT_WIDTH" --margin "0 0" --padding "1 5" --border rounded -- "$@"
+    gum style --width "$UI_BOX_CONTENT_WIDTH" --margin "0 0" --padding "0 $UI_BOX_PAD" --border rounded -- "$@"
 }
 
 # Bold, centred subtitle. $2 (optional) overrides its width - defaults to
@@ -429,13 +457,26 @@ ui_subtitle () {
 
 # Notification element.
 ui_notify () {
-    gum style --width "$UI_NOTIFY_WIDTH" --margin "1 0" --padding "1 5" --border double --align center --foreground="#D5A021" --border-foreground="#D5A021" -- "$@"
+    gum style --width "$UI_NOTIFY_WIDTH" --margin "0 0" --padding "0 $UI_NOTIFY_PAD" --border double --align center --foreground="#D5A021" --border-foreground="#D5A021" -- "$@"
+}
+
+# Columns the Cancel hint needs for the active language: its own string plus
+# the box's "1 1" padding, never below UI_HINT_WIDTH. ${#s} counts bytes when
+# the locale is C, which over-estimates a non-ASCII string - the safe
+# direction, since too wide merely looks roomy while too narrow wraps the
+# hint onto a second line and unbalances the title row.
+_cancel_hint_width () {
+    local s w
+    s="$(t ui.cancel_hint)"
+    w=$(( $(_text_width "$s") + 2 * UI_HINT_PAD ))
+    (( w < UI_HINT_WIDTH )) && w=$UI_HINT_WIDTH
+    printf '%s' "$w"
 }
 
 # Cancel pseudo-element: bold, right-aligned in its own column, never inside a
 # bordered element. Only ever composed into ui_title_row.
 ui_cancel_hint () {
-    gum style --width "$UI_HINT_WIDTH" --margin "0 0" --padding "1 1" --border thick --bold --align center --foreground="#D5A021" --border-foreground="#D5A021" -- "$(t ui.cancel_hint)"
+    gum style --width "$(_cancel_hint_width)" --margin "0 0" --padding "0 $UI_HINT_PAD" --border thick --bold --align center --foreground="#D5A021" --border-foreground="#D5A021" -- "$(t ui.cancel_hint)"
 }
 
 # Gap element: one blank line, printed right before every interactive widget
@@ -452,16 +493,20 @@ ui_gap () {
 # the Cancel hint (i.e. every screen except Finish, which has no hint and uses
 # ui_title() alone via render_page_plain).
 ui_title_row () {
+    local hint_w
+    hint_w="$(_cancel_hint_width)"
     gum join --horizontal --align center -- \
-        "$(ui_title "$1" "$UI_TITLE_ROW_WIDTH")" "$(ui_cancel_hint)"
+        "$(ui_title "$1" "$(( UI_WIDTH - 4 - hint_w ))")" "$(ui_cancel_hint)"
 }
 
 # Table element: every "Field / Value" list in the app (info/metadata/status,
 # Welcome's config summary) is a standalone, self-bordered "gum table" - a
 # sibling of the other elements on the page, not nested inside a Normal box.
 # gum table's own --widths is a no-op in --print mode, so each field is padded
-# to a fixed width (UI_TABLE_LABEL_WIDTH / UI_TABLE_VALUE_WIDTH) before gum
-# ever sees it - gum then just renders already-fixed-width cells. $1/$2 are
+# to a fixed width here before gum ever sees it - UI_TABLE_LABEL_WIDTH, which
+# load_config has already sized for the active language (see
+# _compute_table_label_width), and whatever is left of UI_WIDTH for the value
+# column - so gum only ever renders already-fixed-width cells. $1/$2 are
 # the two column headers (the first column's header doubles as the table's
 # title, e.g. "Info"/"Metadata"/"Status" - leave $2 empty for no header on the
 # value column); the rest are label/value pairs:
@@ -472,10 +517,12 @@ ui_kv_table () {
     # of keeping an empty column name), so an empty header is a single space.
     local col1="$1" col2="${2:- }"; shift 2
     local rows="" label value padded_label padded_value
+    local value_w=$(( UI_WIDTH - UI_TABLE_LABEL_WIDTH - 7 ))
+
     while [[ $# -ge 2 ]]; do
         label="$1"; value="${2:--}"
         printf -v padded_label '%-*s' "$UI_TABLE_LABEL_WIDTH" "$label"
-        printf -v padded_value '%-*s' "$UI_TABLE_VALUE_WIDTH" "$value"
+        printf -v padded_value '%-*s' "$value_w" "$value"
         rows+="$padded_label"$'\t'"$padded_value"$'\n'
         shift 2
     done
@@ -483,16 +530,65 @@ ui_kv_table () {
         --separator "$(printf '\t')" --columns "$col1,$col2"
 }
 
+# Character count of $1, independent of the active locale. "${#s}" counts
+# BYTES under LC_ALL=C, so Spanish's "Nombre de Sesión" measures 17 there but
+# occupies 16 columns - enough to misalign a hand-padded column by one. This
+# drops UTF-8 continuation bytes (0x80-0xBF) and counts what is left, which is
+# the character count whatever the locale. (A CJK character still counts as
+# one while occupying two columns - the same simplification clip_text and
+# ui_kv_table already make.)
+_text_width () {
+    local LC_ALL=C
+    local s="${1//[$'\x80'-$'\xbf']/}"
+    printf '%s' "${#s}"
+}
+
+# The Table element's flat counterpart: "Label: value" lines, one per pair,
+# with every value aligned to one column past the widest label. NOT an element
+# of its own - it produces the CONTENT that a Normal element (ui_box) then
+# frames, for the handful of labelled values that do not deserve a whole
+# bordered table of their own (the Recording screen's session facts). Same
+# call shape as ui_kv_table minus the two column headers:
+# ui_kv_lines "L1" "V1" "L2" "V2" ...
+ui_kv_lines () {
+    local -a cells=("$@")
+    local label value out="" pad i w=0 n
+
+    for ((i = 0; i < ${#cells[@]}; i += 2)); do
+        n="$(_text_width "${cells[i]}")"
+        (( n > w )) && w=$n
+    done
+
+    while [[ $# -ge 2 ]]; do
+        label="$1"; value="${2:--}"
+        # Pad by measured width rather than with printf's own "%-*s": that
+        # one counts bytes under a C locale, which silently misaligns any
+        # label holding an accent. +1 accounts for the colon.
+        n="$(_text_width "$label:")"
+        printf -v pad '%*s' "$(( w + 1 - n ))" ''
+        out+="$label:$pad $value"$'\n'
+        shift 2
+    done
+    printf '%s' "${out%$'\n'}"
+}
+
 # Pager element: a real "gum pager" invocation - full-screen scrollable text
 # viewer. $1 is a file path (its content is shown verbatim). Used only for
 # About Profile's README content, which can be arbitrarily long.
 ui_pager () {
-    gum pager < "$1"
+    # --soft-wrap so a long line folds instead of running off the right edge,
+    # and line numbers off: this shows a README to a user, not a source file.
+    gum pager --soft-wrap --show-line-numbers=false < "$1"
 }
 
-# Shorten a long value (paths) so a table row does not wrap.
+# Shorten a long value (paths) so a table row does not wrap. The default cap
+# is the value column a Table actually has right now - UI_WIDTH minus the
+# label column load_config sized for the active language, minus gum table's
+# own 7 columns of chrome - so it follows both UI_WIDTH and the language
+# instead of being a constant that silently stops matching either.
 clip_text () {
-    local s="$1" max="${2:-65}"
+    local s="$1"
+    local max="${2:-$(( UI_WIDTH - UI_TABLE_LABEL_WIDTH - 7 ))}"
     if (( ${#s} > max )); then
         s="…${s: -$((max - 1))}"
     fi
@@ -546,6 +642,24 @@ screen_leave () {
 # whatever the previous frame left below - avoids a full-clear flash.
 paint_frame () {
     printf '\033[H%s\033[J' "$1"
+}
+
+# The Recording screen's activity indicator, drawn by this script rather than
+# by gum. One character, rewritten in place on the line the frame ends on, so
+# a tick costs a single printf - no subprocess, and nothing that touches the
+# terminal's modes. A gum widget doing this in the background owned /dev/tty
+# in raw mode and cost us both Ctrl+C and the first track's metadata; see the
+# Recording screen note in AGENTS.md.
+UI_SPINNER_FRAMES=$'|/-\\'
+
+# $1 tick counter, $2 the label to sit beside the frame. The label is drawn
+# by this function rather than printed once beforehand because the leading
+# "\r" returns to column 0 on every tick: a separately-printed title had its
+# first characters eaten ("Waiting for the audio sink..." rendered as
+# "-iting for the audio sink...").
+ui_spinner_tick () {
+    [[ -t 1 ]] || return 0
+    printf '\r %s %s' "${UI_SPINNER_FRAMES:$(( $1 % ${#UI_SPINNER_FRAMES} )):1}" "${2:-}"
 }
 
 ###############################################################################
@@ -609,6 +723,43 @@ ensure_config_dir () {
     fi
 }
 
+# Widens UI_TABLE_LABEL_WIDTH to whatever the ACTIVE language actually needs
+# for its table labels, clamped to UI_TABLE_LABEL_MAX. Called once, from
+# load_config, after both the main and the module catalog are loaded.
+#
+# It has to be one shared width rather than a per-table one: ui_kv_table
+# always runs inside "$( )" - a subshell - so a table cannot publish a width
+# for its siblings to reuse, and sizing each table to its own labels leaves
+# the Recording screen's stacked Info/Metadata/Status borders misaligned.
+#
+# Profile Settings menu labels share the ".field." id namespace but never
+# appear in a table and run much longer ("Coincidencia de Sink (globs
+# separados por espacios)"), so the active module's schema labels are
+# excluded explicitly rather than by id pattern.
+_compute_table_label_width () {
+    local id label w=$UI_TABLE_LABEL_WIDTH
+    local -A menu_labels=()
+
+    if declare -F profile_config_schema >/dev/null 2>&1; then
+        while IFS= read -r label; do
+            [[ -n "$label" ]] && menu_labels["$label"]=1
+        done < <(profile_config_schema | cut -f2)
+    fi
+
+    for id in "${!MSG_en[@]}"; do
+        case "$id" in
+            *.field.*|*.table.*) ;;
+            *) continue ;;
+        esac
+        label="$(t "$id")"
+        [[ -n "${menu_labels[$label]:-}" ]] && continue
+        (( ${#label} > w )) && w=${#label}
+    done
+
+    (( w > UI_TABLE_LABEL_MAX )) && w=$UI_TABLE_LABEL_MAX
+    printf '%s' "$w"
+}
+
 # Fixed, generic keys every config file has, independent of which profile
 # module is active. Shared by save_config (what it always writes) and
 # load_config (nothing special needed there - a bare "source" picks them up).
@@ -626,7 +777,7 @@ _profile_schema_keys () {
 }
 
 # Reads the whole config file once, at process startup (see main()/
-# _internal_wait, the only two callers, each running it exactly once). Every
+# once per process, from main(). Every
 # Settings/Profile Settings edit after that still validates and saves to disk
 # immediately, but never calls this again - see "Settings edits" below and
 # apply_config_changes().
@@ -644,11 +795,21 @@ load_config () {
     effective_language="$(resolve_language)"
     load_lang_dir "$(lang_root)"
 
-    if [[ -z "${default_profile:-}" ]] || ! _profile_available "$default_profile"; then
-        default_profile="spotify_native"
+    # Only "is it still installed?" - deliberately NOT _profile_available,
+    # which also requires membership in enabled_profiles: a config whose
+    # enabled_profiles no longer lists its own default_profile must keep that
+    # default and have it re-added below, not silently switch modules.
+    if ! _profile_installed "${default_profile:-}"; then
+        # No specific module is baked into the main script - ask what is
+        # actually installed under profiles/ which one wants to be default.
+        default_profile="$(_default_profile_fallback)"
     fi
     if [[ -z "${enabled_profiles:-}" ]]; then
-        enabled_profiles="$default_profile"
+        # Fresh install: enable everything discovered, so Change Profile is
+        # immediately useful. Narrowing the list is what Settings -> Enabled
+        # Profiles is for, and there is nothing to narrow yet.
+        enabled_profiles="$(list_profile_modules | tr '\n' ' ')"
+        enabled_profiles="${enabled_profiles% }"
     fi
     # default_profile's own module is always implicitly enabled, even if it
     # was left out of - or removed from - the persisted list.
@@ -675,6 +836,10 @@ load_config () {
     else
         profile_activate
     fi
+
+    # Both catalogs are loaded and the module's schema is callable by now, so
+    # the tables can finally be sized for the language actually in use.
+    UI_TABLE_LABEL_WIDTH="$(_compute_table_label_width)"
 }
 
 save_config () {
@@ -806,22 +971,44 @@ list_profile_modules () {
     done | sort
 }
 
+# True when $1 names a module that exists on disk, whether or not it is
+# currently listed in enabled_profiles.
+_profile_installed () {
+    [[ -n "${1:-}" ]] || return 1
+    [[ -f "$(profiles_root)/$1/profile.sh" ]]
+}
+
 # True when $1 names a module that both exists on disk and is listed in
 # enabled_profiles.
 _profile_available () {
     local name="$1" m
-    [[ -n "$name" ]] || return 1
-    [[ -f "$(profiles_root)/$name/profile.sh" ]] || return 1
+    _profile_installed "$name" || return 1
     for m in ${enabled_profiles:-}; do
         [[ "$m" == "$name" ]] && return 0
     done
     return 1
 }
 
+# The module a fresh install (or a config naming a module that is no longer
+# installed) starts on: the first one that ships a "DEFAULT" marker file in
+# its own directory, else simply the first one found. This is how a module
+# declares itself the sensible out-of-the-box choice WITHOUT this script ever
+# naming one - dropping in a third-party module marked DEFAULT changes what a
+# clean install starts on, no patching here required (see PROFILES.md).
+_default_profile_fallback () {
+    local name root
+    root="$(profiles_root)"
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        [[ -f "$root/$name/DEFAULT" ]] && { printf '%s\n' "$name"; return; }
+    done < <(list_profile_modules)
+    list_profile_modules | head -1
+}
+
 # Sources profiles/<name>/lang/ (if present - one file per language, same
 # convention as lang_root(), see load_lang_dir() above) and
 # profiles/<name>/profile.sh into this process. load_config() is the only
-# caller, and it only ever runs once per process (see main()/_internal_wait)
+# caller, and it only ever runs once per process (see main())
 # - so this never needs to guard against loading a second, different module
 # mid-session.
 load_profile_module () {
@@ -925,13 +1112,12 @@ welcome_screen () {
         items+=("$(t welcome.menu.about)" "$(t welcome.menu.exit)")
 
         render_page "$(t welcome.title)" \
-            "$(ui_box "$(t welcome.message)")" \
             "$(ui_subtitle "$(t welcome.config_heading)" "$UI_WIDTH")" \
             "$(ui_kv_table "$(t common.table.field)" "$(t common.table.value)" \
+                "$(t welcome.field.player_profile)" "$default_profile" \
                 "$(t welcome.field.codec)" "$record_format" \
                 "$(t welcome.field.aac_profile)" "$aac_profile" \
                 "$(t welcome.field.bitrate)" "${bitrate} kbps" \
-                "$(t welcome.field.player_profile)" "$default_profile" \
                 "$(t welcome.field.output_directory)" "$(clip_text "$output_directory")")"
         ui_gap
         choice="$(gum choose --header "$(t welcome.menu.header)" --cursor="$UI_CURSOR" --selected "${items[0]}" -- "${items[@]}")" || _cancel_and_exit
@@ -951,7 +1137,7 @@ welcome_screen () {
 }
 
 # "exec" replaces this process outright (same technique the Recording
-# Wizard's own "$0 --internal-wait ..." re-exec already relies on) - a true,
+# only way to apply a saved change) - a true,
 # immediate restart straight back into a freshly-sourced script and a fresh
 # load_config(), picking up whatever Settings/Profile Settings edits were
 # saved to disk during this run (see "Settings edits" - nothing reloads
@@ -991,7 +1177,7 @@ profile_menu () {
 # the Welcome menu to actually load the newly-chosen module.
 change_profile_screen () {
     local -a available=()
-    local m choice
+    local m choice header
     for m in $(list_profile_modules); do
         case " $enabled_profiles " in
             *" $m "*) available+=("$m") ;;
@@ -999,9 +1185,16 @@ change_profile_screen () {
     done
     [[ ${#available[@]} -eq 0 ]] && available=("$default_profile")
 
-    render_page "$(t profile.title)"
-    ui_gap
-    choice="$(gum filter --header "$(t profile.change.header)" --prompt="$UI_CURSOR" -- "${available[@]}")" || return
+    # Unlike gum choose (drawn inline, right where render_page left off),
+    # gum filter switches the terminal to its own alternate screen buffer
+    # the instant it starts - so anything render_page prints beforehand is
+    # never actually seen; it's hidden for the whole time filter is open,
+    # then simply discarded once profile_menu()'s loop redraws next. The
+    # Title row has to be part of gum filter's own --header instead, since
+    # that's the only thing this command actually renders.
+    header="$(ui_title_row "$(t profile.title)")
+$(t profile.change.header)"
+    choice="$(gum filter --header "$header" --prompt="$UI_CURSOR" -- "${available[@]}")" || return
     [[ -n "$choice" && "$choice" != "$default_profile" ]] || return
 
     default_profile="$choice"
@@ -1058,10 +1251,13 @@ profile_settings_screen () {
 about_profile_screen () {
     local readme
     readme="$(profiles_root)/$default_profile/README.md"
-    render_page "$(t profile.title)"
     if [[ -r "$readme" ]]; then
+        # No render_page first: gum pager, like gum filter (see
+        # change_profile_screen), takes over its own alternate screen buffer
+        # the instant it starts, so anything drawn beforehand is never seen.
         ui_pager "$readme"
     else
+        render_page "$(t profile.title)"
         printf '%s\n' "$(ui_notify "$(t profile.about.no_readme)")"
         ui_gap
         printf '%s\n' "$(gum style --bold -- "$(t common.press_any_key_continue)")"
@@ -1071,13 +1267,7 @@ about_profile_screen () {
 
 about_screen () {
     render_page "$(t about.title)" \
-        "$(ui_box \
-            "$(t about.app_line "$SCRIPT_VERSION")" \
-            "" \
-            "$(t about.description)" \
-            "" \
-            "$(t about.license)" \
-            "$(t about.homepage)")"
+        "$(ui_box "$(t about.body "$SCRIPT_VERSION")")"
     ui_gap
     printf '%s\n' "$(gum style --bold -- "$(t common.press_any_key_continue)")"
     read -rsn1 || true
@@ -1304,12 +1494,7 @@ config_screen () {
             "$(t common.back)"
         )
         render_page "$(t config.title)" \
-            "$(ui_notify \
-                "$(t config.notify.autosave)" \
-                "$(t config.notify.requires_apply)" \
-                "$(t config.notify.edit_directly)" \
-                "" \
-                "$config_path")"
+            "$(ui_notify "$(t config.notify.body "$config_path")")"
         ui_gap
         choice="$(gum choose --header "$(t config.header)" --cursor="$UI_CURSOR" -- "${items[@]}")" || return
         for i in "${!items[@]}"; do
@@ -1331,7 +1516,7 @@ config_screen () {
 # Recording Wizard
 #
 # wizard_step_screen() is the generic, reusable step-screen renderer: any
-# profile module's profile_run() can call it. $4 (heading) and the remaining
+# profile module's profile_run() can call it. $3 (heading) and the remaining
 # instruction-line args are expected to already be translated by the caller -
 # this function itself only knows the generic "kind" vocabulary (sink/
 # stopped/playing) for the spinner title. The actual step sequence (which
@@ -1340,8 +1525,8 @@ config_screen () {
 ###############################################################################
 
 wizard_step_screen () {
-    local n="$1" spinner="$2" kind="$3" heading="$4"; shift 4
-    local spin_title
+    local n="$1" kind="$2" heading="$3"; shift 3
+    local spin_title tick=0 rc
     case "$kind" in
         sink)    spin_title="$(t wizard.spin.sink)" ;;
         stopped) spin_title="$(t wizard.spin.stopped)" ;;
@@ -1353,9 +1538,31 @@ wizard_step_screen () {
         "$(ui_box "$(ui_subtitle "$(t wizard.step_label "$n" "$heading")")" "" "$@")"
     ui_gap
 
-    gum spin --spinner "$spinner" --title "$spin_title" -- \
-        "$0" --internal-wait "$kind" --config "$config_path" \
-        || _cancel_and_exit
+    # Polled right here. This used to re-exec the whole script
+    # ("$0" --internal-wait <kind> --config ...) for the single reason that
+    # "gum spin" needs an external command to animate; with the spinner drawn
+    # by this script the wait is just a loop, and the re-exec, its dispatch at
+    # the bottom of the file and its own little --config parser all went away
+    # with it. The condition is still only checked once a second - it shells
+    # out to pactl/dbus-send - while the spinner ticks five times faster.
+    while true; do
+        [[ $should_exit -eq 0 ]] || _cancel_and_exit
+        if (( tick % 5 == 0 )); then
+            if [[ "$kind" == "sink" ]]; then
+                get_target_sink_index && break
+            else
+                profile_wait_condition "$kind"; rc=$?
+                [[ $rc -eq 0 ]] && break
+                # 2 = a kind this module does not define at all: it is never
+                # going to come true, so stop instead of spinning forever.
+                [[ $rc -eq 2 ]] && _cancel_and_exit
+            fi
+        fi
+        tick=$((tick + 1))
+        ui_spinner_tick "$tick" "$spin_title"
+        sleep 0.2
+    done
+    printf '\n'
 }
 
 ###############################################################################
@@ -1455,14 +1662,113 @@ move_target_output () {
 
 ###############################################################################
 # Filename building
+#
+# Every path component ends up going through _portable_component() (see
+# file_path_structure), whichever scheme built it. Linux happily accepts names
+# this app would otherwise produce - a 172-character album title, a folder
+# called "NUL" - but the point of the output tree is that it can be COPIED:
+# to a Windows or macOS machine, or onto a FAT/exFAT stick. All three break on
+# names Linux is fine with, so the portability rules are applied here rather
+# than left to whoever moves the files later.
 ###############################################################################
 
-sanitize_str () {
-    if [[ "$1" == "strict" ]]; then
-        tr -dc '[:alnum:]\n\r' <<< "$2"
-    elif [[ "$1" == "strict-lc" ]]; then
-        tr -dc '[:alnum:]\n\r' <<< "$2" | tr '[:upper:]' '[:lower:]'
+# Longest a single component (artist / album / file name) may be. Chosen for
+# portability, not for one filesystem: ext4/NTFS allow 255, but Windows still
+# defaults to a 260-character limit on the WHOLE path and these names sit
+# three levels below the output directory. 100 is longer than virtually every
+# real artist, album or track name - the ones it does cut are the "Greatest
+# Show on Earth_ 30 Circus Songs Including Entry of the Gladiators, ..." kind
+# that are awkward everywhere anyway. A very deep output_directory can still
+# push a full path past Windows' limit; that part is the user's to control.
+FILENAME_COMPONENT_MAX=100
+# And a byte cap, because ext4/APFS limit a component to 255 BYTES: 100
+# characters of CJK or heavily accented text is 300+ bytes and would be
+# rejected by the filesystem despite passing the character cap above.
+FILENAME_COMPONENT_MAX_BYTES=200
+# Reserved by Windows as device names, rejected as a file OR folder name on
+# every drive, with or without an extension ("CON.m4a" fails just like "CON").
+FILENAME_RESERVED_NAMES="CON PRN AUX NUL \
+COM0 COM1 COM2 COM3 COM4 COM5 COM6 COM7 COM8 COM9 \
+LPT0 LPT1 LPT2 LPT3 LPT4 LPT5 LPT6 LPT7 LPT8 LPT9"
+
+# Byte length of $1. "local LC_ALL=C" makes bash measure ${#1} in bytes
+# instead of characters for the duration of this call, and restores the
+# locale on return - no subprocess, unlike piping through "wc -c".
+_component_bytes () {
+    local LC_ALL=C
+    printf '%s' "${#1}"
+}
+
+# Caps $1 to FILENAME_COMPONENT_MAX characters and FILENAME_COMPONENT_MAX_BYTES
+# bytes, whichever bites first. Always cuts on a character boundary (bash
+# slices by character under a UTF-8 locale, so a multi-byte sequence is never
+# split in half and left as a broken filename), prefers the last word boundary
+# when that keeps most of the text, and trims punctuation the cut exposed.
+_truncate_component () {
+    local s="$1" nb cut
+
+    (( ${#s} > FILENAME_COMPONENT_MAX )) && s="${s:0:FILENAME_COMPONENT_MAX}"
+
+    # Drop whole characters until the byte cap is satisfied. The step is sized
+    # from the overflow (a UTF-8 character is at most 4 bytes) so this settles
+    # in a couple of passes instead of one character at a time.
+    nb="$(_component_bytes "$s")"
+    while [[ -n "$s" ]] && (( nb > FILENAME_COMPONENT_MAX_BYTES )); do
+        s="${s:0:${#s} - ( (nb - FILENAME_COMPONENT_MAX_BYTES + 3) / 4 + 1 )}"
+        nb="$(_component_bytes "$s")"
+    done
+
+    # Only when something was actually cut: back up to the previous space so
+    # the name ends on a whole word - but not if that throws away a quarter of
+    # what is left (a single very long word would otherwise vanish entirely) -
+    # then drop the comma or dash the cut is likely to have landed on, which
+    # would read like a typo at the end of a name. Deliberately does NOT touch
+    # a trailing "_": that one stands in for a character the sanitizer
+    # replaced ("Song?" -> "Song_"), so removing it would lose information.
+    if (( ${#s} < ${#1} )); then
+        cut="${s% *}"
+        (( ${#cut} >= (${#s} * 3) / 4 )) && s="$cut"
+        s="${s%"${s##*[![:space:].,;:-]}"}"
     fi
+
+    # Always, cut or not: Windows silently strips a trailing dot or space, so
+    # "Album ." and "Album" would collapse to the same folder there.
+    s="${s%"${s##*[![:space:].]}"}"
+    printf '%s' "$s"
+}
+
+# The single portability gate every component passes through: length-capped,
+# and never one of Windows' reserved device names.
+_portable_component () {
+    local s upper
+    s="$(_truncate_component "$1")"
+    upper="$(printf '%s' "$s" | tr '[:lower:]' '[:upper:]')"
+    case " $FILENAME_RESERVED_NAMES " in
+        *" $upper "*) s="${s}_" ;;
+    esac
+    printf '%s' "$s"
+}
+
+sanitize_str () {
+    local out=""
+    if [[ "$1" == "strict" ]]; then
+        out="$(tr -dc '[:alnum:]' <<< "$2")"
+    elif [[ "$1" == "strict-lc" ]]; then
+        out="$(tr -dc '[:alnum:]' <<< "$2" | tr '[:upper:]' '[:lower:]')"
+    fi
+    # The same fallback sanitize_component already applies, and for the same
+    # reason: metadata holding no ASCII alphanumerics at all (a CJK artist
+    # name, say) sanitizes away to nothing here, which collapsed the whole
+    # path - "Artist/Album/Title.m4a" became "//.m4a", one nameless hidden
+    # file at the session root that every track of the session then collided
+    # on. Both shipped placeholders are plain ASCII, so they satisfy these
+    # schemes' own alphanumerics-only contract too.
+    if [[ -z "$out" ]]; then
+        out="$(t filename.unknown_component)"
+        # Match the scheme the caller asked for, so strict-lc stays lowercase.
+        [[ "$1" == "strict-lc" ]] && out="${out,,}"
+    fi
+    printf '%s' "$out"
 }
 
 # "normal" scheme component: keep Unicode letters/marks, strip only path-unsafe
@@ -1509,16 +1815,19 @@ file_path_structure () {
 
     case "$filename_scheme" in
         normal)
-            outdir="$session_output_directory/$(sanitize_component "$i_artist")/$(sanitize_component "$i_album")"
-            outfile="$(sanitize_component "$i_title").$extension"
+            outdir="$session_output_directory/$(_portable_component "$(sanitize_component "$i_artist")")/$(_portable_component "$(sanitize_component "$i_album")")"
+            outfile="$(_portable_component "$(sanitize_component "$i_title")").$extension"
             ;;
         strict)
-            outdir="$session_output_directory/$(sanitize_str "strict" "$i_artist")/$(sanitize_str "strict" "$i_album")"
-            outfile="$(sanitize_str "strict" "$i_title").$extension"
+            outdir="$session_output_directory/$(_portable_component "$(sanitize_str "strict" "$i_artist")")/$(_portable_component "$(sanitize_str "strict" "$i_album")")"
+            outfile="$(_portable_component "$(sanitize_str "strict" "$i_title")").$extension"
             ;;
         strict-lc-nodir)
+            # The three parts are joined FIRST and the whole basename capped:
+            # three individually-legal parts still add up to one illegally
+            # long file name, and here they are one name, not three.
             outdir="$session_output_directory"
-            outfile="$(sanitize_str "strict-lc" "$i_artist")_$(sanitize_str "strict-lc" "$i_album")_$(sanitize_str "strict-lc" "$i_title").$extension"
+            outfile="$(_portable_component "$(sanitize_str "strict-lc" "$i_artist")_$(sanitize_str "strict-lc" "$i_album")_$(sanitize_str "strict-lc" "$i_title")").$extension"
             ;;
         *)
             # Unreachable: filename_scheme is validated at startup.
@@ -1706,33 +2015,11 @@ tui_set () {
         track)       tui_track="$2" ;;
         artist)      tui_artist="$2" ;;
         album)       tui_album="$2" ;;
-        tracknumber) tui_tracknumber="$2" ;;
-        discnumber)  tui_discnumber="$2" ;;
-        output)      tui_output="$2" ;;
     esac
     status_dirty=1
     return 0
 }
 
-# tui_output made relative to the session folder (Artist/Album/File).
-status_output_relpath () {
-    local f="${tui_output:--}"
-    if [[ "$f" == "-" || -z "$f" ]]; then
-        printf -- '-'
-    elif [[ -n "$session_output_directory" && "$f" == "$session_output_directory/"* ]]; then
-        printf '%s' "${f#"$session_output_directory"/}"
-    else
-        printf '%s' "$f"
-    fi
-}
-
-_kill_spinner () {
-    if [[ -n "$_spinner_pid" ]]; then
-        kill "$_spinner_pid" 2>/dev/null || true
-        wait "$_spinner_pid" 2>/dev/null || true
-    fi
-    _spinner_pid=""
-}
 
 # shellcheck disable=SC2034  # should_exit is read by the active profile module's recording_main_loop()
 end_session () {
@@ -1768,7 +2055,6 @@ remove_null_sink () {
 }
 
 cleanup () {
-    _kill_spinner
     # "drain" so a manual quit mid-track still finalizes the current file.
     stop_current_recording "drain"
     if declare -F profile_cleanup >/dev/null 2>&1; then
@@ -1815,28 +2101,6 @@ get_options () {
 }
 
 ###############################################################################
-# Internal worker used by the Recording Wizard's spinner (gum spin wraps this
-# process so the wait animates with a real gum spinner and Ctrl+C cancels it
-# like any other foreground command).
-###############################################################################
-
-_internal_wait () {
-    local kind="$1"; shift
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --config) config_path="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
-    load_config
-    case "$kind" in
-        sink)             until get_target_sink_index; do sleep 1; done ;;
-        stopped|playing)  until profile_wait_condition "$kind"; do sleep 1; done ;;
-        *)                return 1 ;;
-    esac
-}
-
-###############################################################################
 # Main
 ###############################################################################
 
@@ -1872,10 +2136,5 @@ main () {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    if [[ "${1:-}" == "--internal-wait" ]]; then
-        shift
-        _internal_wait "$@"
-        exit $?
-    fi
     main "$@"
 fi

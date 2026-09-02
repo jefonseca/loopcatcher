@@ -12,7 +12,20 @@
 # here never touches lang/en.sh or any other language's file.
 #
 # Keep %s placeholder COUNT AND ORDER identical to lang/en.sh's entry for the
-# same id - t() passes the same argument list to whichever one it picks.
+# same id - t() passes the same argument list to whichever one it picks. Un
+# signo de porcentaje literal se escribe "%%" en una entrada que lleva args.
+#
+# UN PANEL, UN MENSAJE. Cuando una pantalla muestra un bloque de texto
+# conectado, es UNA sola entrada MULTILÍNEA (una cadena entre comillas
+# simples que abarca varias líneas), no un id por frase - así se traduce
+# como el texto conectado que realmente es, con libertad para reordenar,
+# unir o partir líneas según convenga al idioma. Dos reglas:
+#   - NO envuelvas una frase a mano para que quepa en la caja. gum envuelve
+#     bien, y una traducción que hay que volver a medir y recortar cada vez
+#     que cambia el diseño o la redacción no es mantenible. Escribe la frase
+#     en una sola línea, por larga que sea.
+#   - Usa un salto de línea solo donde SIGNIFIQUE algo: uno por elemento de
+#     lista, y una línea en blanco donde quieras una línea en blanco.
 #
 # "declare -gA" (not just "-A") below is required - see lang/en.sh's header
 # comment for why: this file is sourced from inside a function, and a plain
@@ -28,7 +41,8 @@ declare -gA MSG_es=(
     [err.requires_tty]='%s requiere una terminal interactiva.'
 
     # --- generic UI chrome ---
-    [ui.cancel_hint]='Pulsa Ctrl+C para cancelar y salir.'
+    [ui.cancel_hint]='Ctrl+C para cancelar'
+    [ui.catching]='Catching...'
     [ui.cancelled]='Cancelado.'
     [common.back]='< Atrás'
     [common.press_any_key_continue]='Pulsa cualquier tecla para continuar.'
@@ -39,11 +53,11 @@ declare -gA MSG_es=(
     [err.cannot_create_config_dir]='no se pudo crear el directorio de configuración: %s'
     [warn.config_mktemp_failed]='no se pudo escribir la configuración (mktemp falló en %s)'
     [err.invalid_record_format]='record_format no válido: %s (permitidos: aac, ogg)'
-    [err.invalid_filename_scheme]='filename_scheme no válido: %s (permitidos: normal, strict, strict-lc-nodir)'
-    [err.invalid_default_profile]='default_profile no válido: %s (no existe en profiles/, o no está en enabled_profiles)'
+    [err.invalid_filename_scheme]='filename_scheme no válido: %s (normal, strict, strict-lc-nodir)'
+    [err.invalid_default_profile]='default_profile no válido: %s (no instalado, o no habilitado)'
     [err.invalid_bitrate]='bitrate no válido: %s (debe ser un entero positivo)'
     [err.invalid_aac_profile]='aac_profile no válido: %s (debe ser un entero positivo)'
-    [err.invalid_tail_drain_seconds]='tail_drain_seconds no válido: %s (debe ser un número no negativo, p. ej. 0.35)'
+    [err.invalid_tail_drain_seconds]='tail_drain_seconds no válido: %s (número no negativo, p. ej. 0.35)'
     [err.invalid_log_level]='log_level no válido: %s (permitidos: 0, 1, 2)'
     [err.invalid_language]='language no válido: %s (permitidos: auto, en, es)'
     [err.profile_module_not_found]='no se encontró el módulo de perfil: %s (%s)'
@@ -63,7 +77,6 @@ declare -gA MSG_es=(
 
     # --- Welcome / main menu ---
     [welcome.title]='Bienvenida'
-    [welcome.message]='Bienvenido a LoopCatcher. Captura el audio de reproducción de tu reproductor de escritorio en archivos organizados y etiquetados automáticamente, listos para usar con la configuración de abajo.'
     [welcome.config_heading]='Configuración'
     [welcome.field.codec]='Códec'
     [welcome.field.aac_profile]='Perfil AAC'
@@ -90,16 +103,22 @@ declare -gA MSG_es=(
 
     # --- About (app-level) ---
     [about.title]='Acerca de'
-    [about.app_line]='LoopCatcher v%s'
-    [about.description]='Un TUI de Linux que captura el audio de reproducción de tu reproductor multimedia de escritorio en archivos organizados y etiquetados automáticamente.'
-    [about.license]='Licencia: MIT'
-    [about.homepage]='Sitio web: https://github.com/jefonseca/loopcatcher'
+    # %s es la versión de la app. Un panel, un mensaje - ver la nota inicial.
+    [about.body]='LoopCatcher v%s
+
+Un TUI de Linux que captura el audio de tu reproductor multimedia de escritorio en archivos organizados y etiquetados automáticamente.
+
+Licencia: MIT
+Sitio web: https://github.com/jefonseca/loopcatcher'
 
     # --- Configuration / Settings ---
     [config.title]='Configuración'
-    [config.notify.autosave]='Cada opción de abajo se guarda automáticamente en cuanto la cambias'
-    [config.notify.requires_apply]='Los cambios solo se aplican cuando eliges "Aplicar cambios de configuración" en el menú de Bienvenida'
-    [config.notify.edit_directly]='También puedes editar el archivo de configuración directamente:'
+    # %s es la ruta del archivo de configuración.
+    [config.notify.body]='Cada opción se guarda automáticamente al cambiarla
+Los cambios solo se aplican cuando eliges "Aplicar cambios de configuración" en el menú de Bienvenida
+También puedes editar el archivo de configuración directamente:
+
+%s'
     [config.header]='Selecciona un grupo'
     [config.group.codecs]='Códecs'
     [config.group.paths]='Rutas'
@@ -163,8 +182,8 @@ Comportamiento:
   - El nombre de la sesión se pide de forma interactiva (con una marca de
     tiempo sugerida; basta con pulsar Enter).
   - La salida va a: directorio-de-salida/nombre-de-sesión
-  - El Asistente de Grabación te guía para crear el sink de audio, pausar
-    y luego iniciar la reproducción para empezar a grabar automáticamente.
+  - El Asistente de Grabación te guía por los pasos que necesite el perfil
+    de reproductor seleccionado antes de empezar a grabar automáticamente.
   - La sesión termina automáticamente cuando la reproducción se pausa, se
     detiene o el reproductor se cierra.
 
@@ -175,33 +194,4 @@ Opciones:
   --version                 Muestra la versión'
     [cli.unknown_argument]='Argumento desconocido: %s'
     [cli.version_line]='loopcatcher versión %s'
-
-    # --- spotify_native module screens (Wizard steps + Recording screen) ---
-    [spotify_native.wizard.step1_heading]='Crear el Sink de Audio'
-    [spotify_native.wizard.step1_line1]='1) Abre tu %s'
-    [spotify_native.wizard.step1_line2]='2) Reproduce cualquier pista que NO sea la primera de la lista o álbum que quieres grabar'
-    [spotify_native.wizard.step2_heading]='Prepárate para grabar'
-    [spotify_native.wizard.step2_line1]='1) Pausa la reproducción en tu %s'
-    [spotify_native.wizard.step3_heading]='Empezar a grabar'
-    [spotify_native.wizard.step3_line1]='1) Reproduce la primera pista de tu lista o álbum para empezar a grabar automáticamente'
-    [spotify_native.recording.title]='Grabación'
-    [spotify_native.table.info]='Info'
-    [spotify_native.table.metadata]='Metadatos'
-    [spotify_native.table.status]='Estado'
-    [spotify_native.field.output_folder]='Carpeta de Salida'
-    [spotify_native.field.session_name]='Nombre de Sesión'
-    [spotify_native.field.config_file]='Archivo de Configuración'
-    [spotify_native.field.audio_sink]='Sink de Audio'
-    [spotify_native.field.artist]='Artista'
-    [spotify_native.field.album]='Álbum'
-    [spotify_native.field.track]='Pista'
-    [spotify_native.field.track_no]='N.º de Pista'
-    [spotify_native.field.disc_no]='N.º de Disco'
-    [spotify_native.field.output_file]='Archivo de Salida'
-    [spotify_native.field.catcher_status]='Estado de Captura'
-    [spotify_native.field.playback_status]='Estado de Reproducción'
-    [spotify_native.status.recording]='Grabando'
-    [spotify_native.status.failed]='Fallido'
-    [spotify_native.status.spinner_suffix]='%s...'
-    [spotify_native.error.dbus_monitor_ended]='loopcatcher: dbus-monitor terminó, la sesión se detuvo.'
 )

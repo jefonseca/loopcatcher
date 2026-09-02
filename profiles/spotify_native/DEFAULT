@@ -1,0 +1,5 @@
+This empty marker file tells loopcatcher that this module is the sensible
+out-of-the-box choice: on a fresh install (no config file yet), or when the
+configured default_profile is no longer installed, the main script starts on
+the first module found carrying a DEFAULT file. Delete this file to drop the
+preference; the script itself never names any module. See PROFILES.md.

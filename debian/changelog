@@ -1,3 +1,51 @@
+loopcatcher (0.3.0-1) unstable; urgency=medium
+
+  * Add a managed capture mode to the Spotify profile ("Manage Spotify",
+    on by default): loopcatcher now detects a native, Flatpak or Snap
+    Spotify install, launches it already routed into the capture sink,
+    plays the track/album/playlist link you paste via MPRIS OpenUri, and
+    closes it again when the session ends. Set "Manage Spotify" to no
+    under Profile -> Profile Settings to keep the previous flow of
+    opening and cueing Spotify yourself.
+  * Make the Spotify profile the one a fresh install starts on, via an
+    optional DEFAULT marker file inside a profile's own directory - the
+    main script still names no module anywhere.
+  * Enable every installed profile on a fresh config, so Change Profile
+    is usable without visiting Settings first.
+  * Show Player Profile first in the Welcome screen's configuration
+    summary.
+  * Fix a config whose enabled_profiles no longer listed its own
+    default_profile silently switching to a different module instead of
+    keeping - and re-enabling - the configured one.
+  * Fix Ctrl+C on the Recording screen not actually stopping the capture
+    - it only made the spinner disappear, leaving the track recording in
+    the background.
+  * Fix metadata occasionally missing from the first track of a session,
+    caused by the player's MPRIS fields arriving out of order.
+  * Fix the managed mode's "Spotify is already running" exit path closing
+    the user's own Spotify instance on the way out.
+  * Make profile teardown verify and escalate (SIGTERM to SIGKILL,
+    flatpak kill to pkill), since GUI applications commonly ignore a
+    plain terminating signal.
+  * Narrow the default layout from 100 to 80 columns so it fits a
+    standard terminal window, with every width now sized relative to the
+    active language's text instead of a fixed number - the Spanish UI no
+    longer overflows the box.
+  * Simplify the Recording screen to what's actually useful mid-session:
+    output folder, session name, capture status and a track/artist/album
+    table - dropped the Config File, Audio Sink, Output File, Track No.,
+    Disc No., Playback Status and Install Type rows. Progress is now
+    shown by a lightweight "Catching..." spinner instead of a background
+    process.
+  * Make output folder and file names portable to other operating
+    systems: components are now capped at 100 characters and 200 bytes
+    (cut on a word boundary), never end in a dot or space, and never
+    collide with a Windows device name such as CON or NUL. Long album
+    titles previously produced folders Linux accepted but Windows,
+    macOS and FAT/exFAT volumes rejected.
+
+ -- Kike Fonseca <filipok@gmail.com>  Wed, 02 Sep 2026 12:00:00 +0000
+
 loopcatcher (0.2.3-1) unstable; urgency=medium
 
   * Add English/Spanish translations for the whole app (Settings ->
