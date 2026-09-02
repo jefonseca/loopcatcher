@@ -1,7 +1,7 @@
 loopcatcher (0.3.1-1) unstable; urgency=medium
 
   * Fix track, album and artist names being cut off at the first quote
-    character - a titles was truncated both in the file name and in
+    character - a title was truncated both in the file name and in
     the tags and on-screen metadata. The MPRIS value is now read whole.
   * Guarantee metadata is available before recording starts: when the
     player announces playback without a usable metadata update (or its
