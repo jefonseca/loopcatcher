@@ -51,6 +51,17 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.4.0" date="2026-09-07">
+      <description>
+        <p>Recording is never done in place any more: each track is captured
+        to a temporary file and moved to its destination only once complete,
+        with a new "Record via System Temp" setting choosing between the
+        system temp directory and a "partial_recording" folder in the output
+        directory. The filename schemes gain friendly names and a new "Stream
+        Collection" mode - a flat single-folder layout (artist_title, album
+        omitted) for online-radio captures, now the default.</p>
+      </description>
+    </release>
     <release version="0.3.1" date="2026-09-02">
       <description>
         <p>Fixes track, album and artist names being cut off at the first
