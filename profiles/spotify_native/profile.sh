@@ -2,25 +2,33 @@
 ###############################################################################
 # spotify_native profile module for loopcatcher.
 #
-# Like spotify_native, detects and captures the official Spotify Linux
-# client via its MPRIS interface - but instead of attaching to an instance
-# the user already opened/paused/routed by hand, this module takes control:
-# it detects how Spotify is installed (native/Flatpak/Snap), launches it
-# itself with PULSE_SINK already pointed at the capture sink (so no sink
-# move is needed), asks for a track/album/playlist URL, starts playback
-# itself via MPRIS OpenUri, and closes the Spotify process it launched once
-# the session ends. This file is `source`d directly into the main script's
-# process by load_profile_module() - never executed on its own - so it
-# shares the main script's global namespace and can call any of its generic
-# helpers (get_target_sink_index, create_null_audio_output, screen_enter/
-# screen_leave, start_recording, stop_current_recording, end_session,
-# tui_set, log_line/log_debug, ui_kv_table,
-# paint_frame, render_page, ui_box, ui_notify, ui_gap, ...).
+# Detects and captures the official Spotify Linux client via its MPRIS
+# interface. It works in either of two modes, chosen by this module's own
+# manage_player setting (Profile Settings), not by picking a different module:
+#   manage_player=yes (default) - loopcatcher DRIVES Spotify: detects how it is
+#     installed (native/Flatpak/Snap), launches it with PULSE_SINK already
+#     pointed at the capture sink (so no sink move is needed), asks for a
+#     track/album/playlist URL, starts playback via MPRIS OpenUri, and closes
+#     the Spotify process it launched once the session ends (see _run_managed).
+#   manage_player=no - loopcatcher ATTACHES to a Spotify the user opened, paused
+#     and cued by hand, routes its sink-input, and waits for them to press Play
+#     (see _run_attached).
+# The pre-recording flow is all that differs; the MPRIS monitor, the Recording
+# screen and the recording loop are shared, which is why the two modes are two
+# functions behind one profile_run rather than two separate modules.
 #
-# This module deliberately copies (rather than shares) spotify_native's
-# MPRIS/recording-loop machinery - every profile module is meant to be
-# fully self-contained (see AGENTS.md's "Profile modules" section), so
-# deleting this directory removes 100% of what it owns.
+# This file is `source`d directly into the main script's process by
+# load_profile_module() - never executed on its own - so it shares the main
+# script's global namespace and can call any of its generic helpers
+# (get_target_sink_index, create_null_audio_output, screen_enter/screen_leave,
+# start_recording, stop_current_recording, end_session, tui_set,
+# log_line/log_debug, ui_kv_table, paint_frame, render_page, ui_box, ui_notify,
+# ui_gap, ...).
+#
+# Every profile module is meant to be fully self-contained (see AGENTS.md's
+# "Profile modules" section) - all of this module's own MPRIS/recording-loop
+# machinery and strings live under this directory, so deleting it removes 100%
+# of what the module owns.
 #
 # Every profile module must define this hook contract (see AGENTS.md):
 #   profile_label()            friendly display name

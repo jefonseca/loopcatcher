@@ -59,6 +59,7 @@ declare -gA MSG_es=(
     [err.invalid_aac_profile]='aac_profile no válido: %s (debe ser un entero positivo)'
     [err.invalid_tail_drain_seconds]='tail_drain_seconds no válido: %s (número no negativo, p. ej. 0.35)'
     [err.invalid_log_level]='log_level no válido: %s (permitidos: 0, 1, 2)'
+    [err.invalid_use_system_temp]='use_system_temp no válido: %s (permitidos: yes, no)'
     [err.invalid_language]='language no válido: %s (permitidos: auto, en, es)'
     [err.profile_module_not_found]='no se encontró el módulo de perfil: %s (%s)'
 
@@ -139,9 +140,11 @@ También puedes editar el archivo de configuración directamente:
     [config.advanced.tail_drain_seconds]='Segundos de Cola:  %s'
     [config.advanced.log_level]='Nivel de Registro:  %s'
     [config.advanced.nulloutput_name]='Nombre del Sink Nulo:  %s'
+    [config.advanced.use_system_temp]='Grabar en Temp del Sistema:  %s'
     [config.advanced.tail_drain_seconds_prompt]='Segundos de cola (p. ej. 0.35)'
     [config.advanced.log_level_prompt]='Nivel de registro (0=apagado, 1=activado, 2=depuración)'
     [config.advanced.nulloutput_name_prompt]='Nombre del sink nulo'
+    [config.advanced.use_system_temp_prompt]='Capturar cada pista primero en la temp del sistema (yes), o en una carpeta partial_recording dentro del directorio de salida (no); en ambos casos el archivo terminado se mueve a su ubicación final'
     [config.top.language]='Idioma:  %s'
     [config.top.language_prompt]='Idioma'
 

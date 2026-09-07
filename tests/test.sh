@@ -583,6 +583,41 @@ test_stop_current_recording_spawns_finalizer_and_clears_paths () {
     [[ "$out" == "count=1|temp=|log=|moved=yes" ]]
 }
 
+test_use_system_temp_no_uses_partial_recording_dir () {
+    local out tmpdir
+    tmpdir="$(mktemp -d)"
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        log_level=0
+        use_system_temp="no"
+        session_output_directory="$tmpdir/out/mysession"
+        init_session_log
+        printf 'dir=%s|exists=%s' \
+            "$rec_temp_dir" \
+            "$([[ -d "$rec_temp_dir" ]] && echo yes || echo no)"
+    })"
+    rm -rf "$tmpdir"
+
+    [[ "$out" == "dir=$tmpdir/out/mysession/partial_recording|exists=yes" ]]
+}
+
+test_use_system_temp_yes_uses_system_temp_dir () {
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        log_level=0
+        use_system_temp="yes"
+        init_session_log
+        # Under the system temp loopcatcher dir, and created.
+        [[ "$rec_temp_dir" == "${TMPDIR:-/tmp}/loopcatcher/"* && -d "$rec_temp_dir" ]] && printf 'SYSTEM_TEMP'
+        rm -rf "$rec_temp_dir"
+    })"
+
+    [[ "$out" == "SYSTEM_TEMP" ]]
+}
+
 test_list_profile_modules_finds_shipped_modules () {
     local out
     out="$({ source "$SCRIPT_PATH"; list_profile_modules; })"
@@ -779,6 +814,7 @@ test_validate_settings_rejects_every_invalid_field () {
         _expect_rejected aac_profile        "abc"
         _expect_rejected tail_drain_seconds "1.2.3"
         _expect_rejected log_level          "3"
+        _expect_rejected use_system_temp    "maybe"
         _expect_rejected language           "fr"
         printf 'done'
     })"
@@ -1343,6 +1379,8 @@ main () {
     run_test test_finalize_recording_moves_temp_to_final
     run_test test_finalize_recording_does_not_clobber_existing_final
     run_test test_stop_current_recording_spawns_finalizer_and_clears_paths
+    run_test test_use_system_temp_no_uses_partial_recording_dir
+    run_test test_use_system_temp_yes_uses_system_temp_dir
     run_test test_list_profile_modules_finds_shipped_modules
     run_test test_default_profile_fallback_prefers_marked_module
     run_test test_load_config_falls_back_to_default_marked_module_when_invalid

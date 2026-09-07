@@ -243,6 +243,11 @@ default_profile=""
 # default_profile's own module is always implicitly included.
 enabled_profiles=""
 nulloutput_name="loopcatcher"
+# "yes" captures each track into system temp (${TMPDIR:-/tmp}); "no" captures
+# into a "partial_recording" folder inside the session's output directory. Either
+# way the finished file is moved to its final path - recording is never in place.
+# See init_session_log, which resolves rec_temp_dir from this.
+use_system_temp="yes"
 aac_profile="29"
 bitrate="48"
 record_format="aac"
@@ -700,8 +705,15 @@ effective_log_file_path () {
 init_session_log () {
     # The recording temp dir is not log-gated - tracks are always captured there
     # first, then moved to their final destination - so it is created before the
-    # log-level guard below. Per-PID so concurrent or crashed runs never collide.
-    rec_temp_dir="${TMPDIR:-/tmp}/loopcatcher/rec-$$"
+    # log-level guard below.
+    if [[ "$use_system_temp" == "no" ]]; then
+        # Inside the session's own output tree, so the finalize move is an atomic
+        # rename (same filesystem) rather than a cross-filesystem copy.
+        rec_temp_dir="$session_output_directory/partial_recording"
+    else
+        # System temp; per-PID so concurrent or crashed runs never collide.
+        rec_temp_dir="${TMPDIR:-/tmp}/loopcatcher/rec-$$"
+    fi
     mkdir -p -- "$rec_temp_dir" 2>/dev/null
 
     [[ "$log_level" -ge 1 ]] || return 0
@@ -779,8 +791,8 @@ _compute_table_label_width () {
 # load_config (nothing special needed there - a bare "source" picks them up).
 _fixed_config_keys () {
     printf '%s\n' log_level default_profile enabled_profiles nulloutput_name \
-        aac_profile bitrate record_format filename_scheme output_directory \
-        tail_drain_seconds log_file_path language
+        use_system_temp aac_profile bitrate record_format filename_scheme \
+        output_directory tail_drain_seconds log_file_path language
 }
 
 # The active profile module's own persisted config keys (see
@@ -790,8 +802,7 @@ _profile_schema_keys () {
     profile_config_schema | cut -f1
 }
 
-# Reads the whole config file once, at process startup (see main()/
-# once per process, from main(). Every
+# Reads the whole config file exactly once per process, from main(). Every
 # Settings/Profile Settings edit after that still validates and saves to disk
 # immediately, but never calls this again - see "Settings edits" below and
 # apply_config_changes().
@@ -926,6 +937,10 @@ _validate_settings () {
     case "$log_level" in
         0|1|2) ;;
         *) t err.invalid_log_level "$log_level"; return 1 ;;
+    esac
+    case "$use_system_temp" in
+        yes|no) ;;
+        *) t err.invalid_use_system_temp "$use_system_temp"; return 1 ;;
     esac
     case "$language" in
         auto|en|es) ;;
@@ -1150,12 +1165,11 @@ welcome_screen () {
     done
 }
 
-# "exec" replaces this process outright (same technique the Recording
-# only way to apply a saved change) - a true,
-# immediate restart straight back into a freshly-sourced script and a fresh
-# load_config(), picking up whatever Settings/Profile Settings edits were
-# saved to disk during this run (see "Settings edits" - nothing reloads
-# mid-session, this is the only way to apply them without relaunching by hand).
+# "exec" replaces this process outright - a true, immediate restart straight
+# back into a freshly-sourced script and a fresh load_config(), picking up
+# whatever Settings/Profile Settings edits were saved to disk during this run
+# (see "Settings edits" - nothing reloads mid-session, so this is the only way
+# to apply a saved change without relaunching by hand).
 apply_config_changes () {
     exec "$0"
 }
@@ -1467,12 +1481,13 @@ config_group_enabled_profiles () {
 
 config_group_advanced () {
     local choice i
-    local -a ids=(tail_drain_seconds log_level nulloutput_name back)
+    local -a ids=(tail_drain_seconds log_level nulloutput_name use_system_temp back)
     while true; do
         local -a items=(
             "$(t config.advanced.tail_drain_seconds "$tail_drain_seconds")"
             "$(t config.advanced.log_level "$log_level")"
             "$(t config.advanced.nulloutput_name "$nulloutput_name")"
+            "$(t config.advanced.use_system_temp "$use_system_temp")"
             "$(t common.back)"
         )
         render_page "$(t config.title)"
@@ -1484,6 +1499,7 @@ config_group_advanced () {
                 tail_drain_seconds) _cfg_edit_input tail_drain_seconds "$(t config.advanced.tail_drain_seconds_prompt)" ;;
                 log_level)          _cfg_edit_choice log_level "$(t config.advanced.log_level_prompt)" 0 1 2 ;;
                 nulloutput_name)    _cfg_edit_input nulloutput_name "$(t config.advanced.nulloutput_name_prompt)" ;;
+                use_system_temp)    _cfg_edit_choice use_system_temp "$(t config.advanced.use_system_temp_prompt)" yes no ;;
                 back)                return ;;
             esac
             break
@@ -2042,7 +2058,6 @@ start_recording () {
 
     # shellcheck disable=SC2034  # recording_failed/status_dirty are read by the active profile module's recording_screen_render()
     recording_failed=false; status_dirty=1
-    tui_set "output" "$finalfile"
 
     # Logged once this recording actually stops (see stop_current_recording),
     # so the log entry can include the real capture duration.
