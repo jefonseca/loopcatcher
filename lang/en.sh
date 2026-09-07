@@ -82,6 +82,7 @@ declare -gA MSG_en=(
     [err.invalid_aac_profile]='Invalid aac_profile: %s (must be a positive integer)'
     [err.invalid_tail_drain_seconds]='Invalid tail_drain_seconds: %s (non-negative number, e.g. 0.35)'
     [err.invalid_log_level]='Invalid log_level: %s (allowed: 0, 1, 2)'
+    [err.invalid_use_system_temp]='Invalid use_system_temp: %s (allowed: yes, no)'
     [err.invalid_language]='Invalid language: %s (allowed: auto, en, es)'
     [err.profile_module_not_found]='profile module not found: %s (%s)'
 
@@ -162,9 +163,11 @@ You can also edit the config file directly:
     [config.advanced.tail_drain_seconds]='Tail Drain Seconds:  %s'
     [config.advanced.log_level]='Log Level:  %s'
     [config.advanced.nulloutput_name]='Null Sink Name:  %s'
+    [config.advanced.use_system_temp]='Record via System Temp:  %s'
     [config.advanced.tail_drain_seconds_prompt]='Tail drain seconds (e.g. 0.35)'
     [config.advanced.log_level_prompt]='Log level (0=off, 1=on, 2=debug)'
     [config.advanced.nulloutput_name_prompt]='Null sink name'
+    [config.advanced.use_system_temp_prompt]='Capture each track into system temp first (yes), or into a partial_recording folder in the output directory (no); either way the finished file is moved to its final place'
     [config.top.language]='Language:  %s'
     [config.top.language_prompt]='Language'
 

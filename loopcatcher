@@ -243,6 +243,11 @@ default_profile=""
 # default_profile's own module is always implicitly included.
 enabled_profiles=""
 nulloutput_name="loopcatcher"
+# "yes" captures each track into system temp (${TMPDIR:-/tmp}); "no" captures
+# into a "partial_recording" folder inside the session's output directory. Either
+# way the finished file is moved to its final path - recording is never in place.
+# See init_session_log, which resolves rec_temp_dir from this.
+use_system_temp="yes"
 aac_profile="29"
 bitrate="48"
 record_format="aac"
@@ -308,6 +313,14 @@ encoder_pid=""
 record_fifo_dir=""
 record_error_log=""
 stopping_recording=false
+# Recordings are captured into rec_temp_dir (system temp) and moved to their
+# final destination only once the encoder has finalized the file. record_temp_file
+# is the in-flight encoder's temp path (parallel to record_log_file, the final
+# intended path); finalizer_pids collects the backgrounded moves still in flight
+# so cleanup() can wait for them before the process exits.
+rec_temp_dir=""
+record_temp_file=""
+finalizer_pids=()
 # Metadata + start time of the in-flight recording, set by start_recording and
 # consumed (then cleared) by stop_current_recording once it actually stops, so
 # the session log gets the real capture duration alongside the metadata.
@@ -690,6 +703,19 @@ effective_log_file_path () {
 }
 
 init_session_log () {
+    # The recording temp dir is not log-gated - tracks are always captured there
+    # first, then moved to their final destination - so it is created before the
+    # log-level guard below.
+    if [[ "$use_system_temp" == "no" ]]; then
+        # Inside the session's own output tree, so the finalize move is an atomic
+        # rename (same filesystem) rather than a cross-filesystem copy.
+        rec_temp_dir="$session_output_directory/partial_recording"
+    else
+        # System temp; per-PID so concurrent or crashed runs never collide.
+        rec_temp_dir="${TMPDIR:-/tmp}/loopcatcher/rec-$$"
+    fi
+    mkdir -p -- "$rec_temp_dir" 2>/dev/null
+
     [[ "$log_level" -ge 1 ]] || return 0
     session_log_path="$(effective_log_file_path)"
     mkdir -p -- "$(dirname "$session_log_path")" 2>/dev/null
@@ -765,8 +791,8 @@ _compute_table_label_width () {
 # load_config (nothing special needed there - a bare "source" picks them up).
 _fixed_config_keys () {
     printf '%s\n' log_level default_profile enabled_profiles nulloutput_name \
-        aac_profile bitrate record_format filename_scheme output_directory \
-        tail_drain_seconds log_file_path language
+        use_system_temp aac_profile bitrate record_format filename_scheme \
+        output_directory tail_drain_seconds log_file_path language
 }
 
 # The active profile module's own persisted config keys (see
@@ -776,8 +802,7 @@ _profile_schema_keys () {
     profile_config_schema | cut -f1
 }
 
-# Reads the whole config file once, at process startup (see main()/
-# once per process, from main(). Every
+# Reads the whole config file exactly once per process, from main(). Every
 # Settings/Profile Settings edit after that still validates and saves to disk
 # immediately, but never calls this again - see "Settings edits" below and
 # apply_config_changes().
@@ -912,6 +937,10 @@ _validate_settings () {
     case "$log_level" in
         0|1|2) ;;
         *) t err.invalid_log_level "$log_level"; return 1 ;;
+    esac
+    case "$use_system_temp" in
+        yes|no) ;;
+        *) t err.invalid_use_system_temp "$use_system_temp"; return 1 ;;
     esac
     case "$language" in
         auto|en|es) ;;
@@ -1136,12 +1165,11 @@ welcome_screen () {
     done
 }
 
-# "exec" replaces this process outright (same technique the Recording
-# only way to apply a saved change) - a true,
-# immediate restart straight back into a freshly-sourced script and a fresh
-# load_config(), picking up whatever Settings/Profile Settings edits were
-# saved to disk during this run (see "Settings edits" - nothing reloads
-# mid-session, this is the only way to apply them without relaunching by hand).
+# "exec" replaces this process outright - a true, immediate restart straight
+# back into a freshly-sourced script and a fresh load_config(), picking up
+# whatever Settings/Profile Settings edits were saved to disk during this run
+# (see "Settings edits" - nothing reloads mid-session, so this is the only way
+# to apply a saved change without relaunching by hand).
 apply_config_changes () {
     exec "$0"
 }
@@ -1453,12 +1481,13 @@ config_group_enabled_profiles () {
 
 config_group_advanced () {
     local choice i
-    local -a ids=(tail_drain_seconds log_level nulloutput_name back)
+    local -a ids=(tail_drain_seconds log_level nulloutput_name use_system_temp back)
     while true; do
         local -a items=(
             "$(t config.advanced.tail_drain_seconds "$tail_drain_seconds")"
             "$(t config.advanced.log_level "$log_level")"
             "$(t config.advanced.nulloutput_name "$nulloutput_name")"
+            "$(t config.advanced.use_system_temp "$use_system_temp")"
             "$(t common.back)"
         )
         render_page "$(t config.title)"
@@ -1470,6 +1499,7 @@ config_group_advanced () {
                 tail_drain_seconds) _cfg_edit_input tail_drain_seconds "$(t config.advanced.tail_drain_seconds_prompt)" ;;
                 log_level)          _cfg_edit_choice log_level "$(t config.advanced.log_level_prompt)" 0 1 2 ;;
                 nulloutput_name)    _cfg_edit_input nulloutput_name "$(t config.advanced.nulloutput_name_prompt)" ;;
+                use_system_temp)    _cfg_edit_choice use_system_temp "$(t config.advanced.use_system_temp_prompt)" yes no ;;
                 back)                return ;;
             esac
             break
@@ -1845,6 +1875,31 @@ file_path_structure () {
 # Recording engine
 ###############################################################################
 
+# _finalize_recording <encoder_pid> <temp_file> <final_path>
+#   Waits for the given encoder to finish writing its temp file, then moves the
+#   completed file to its final destination. Run backgrounded from
+#   stop_current_recording (and awaited by cleanup) so a track change never
+#   blocks capture on the previous track's finalize.
+_finalize_recording () {
+    local enc="$1" temp="$2" final="$3" waited=0
+    # The encoder is a child of the main shell, not of this subshell, so it
+    # cannot be waited on - poll with kill -0 instead. Bounded (~30s) so a wedged
+    # encoder cannot hang the move forever; whatever was written is then moved.
+    while [[ -n "$enc" ]] && kill -0 "$enc" 2>/dev/null && [[ $waited -lt 300 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [[ -f "$temp" ]] || return 0
+    mkdir -p -- "$(dirname -- "$final")"
+    # A same-titled track whose deferred move is still pending could occupy the
+    # final path; re-uniquify at move time rather than clobber it.
+    if [[ -e "$final" ]]; then
+        final="$(unique_output_path "$final")"
+        log_line "final path already existed, moved recording to $final"
+    fi
+    mv -- "$temp" "$final"
+}
+
 # stop_current_recording [quick|drain]
 #   quick (default) - track change: stop capture and return immediately; the
 #     encoder keeps running, sees EOF, finalizes its file and exits on its own.
@@ -1890,7 +1945,13 @@ stop_current_recording () {
     if [[ -n "$record_log_file" ]]; then
         log_recording "$record_log_artist" "$record_log_album" "$record_log_title" \
             "$record_log_tracknumber" "$record_log_discnumber" "$record_log_file" "$duration"
+        # The encoder writes to a temp file; move it to its final destination
+        # only once it has finalized. In quick mode the encoder is still running,
+        # so the move must run in the background, waiting on that encoder's PID.
+        _finalize_recording "$old_encoder" "$record_temp_file" "$record_log_file" &
+        finalizer_pids+=("$!")
         record_log_file=""
+        record_temp_file=""
     fi
 
     # Safe to remove now: an unlinked FIFO / log stays valid for a background
@@ -1904,13 +1965,16 @@ stop_current_recording () {
 
 start_recording () {
     local i_artist="$1" i_album="$2" i_title="$3" i_albumartist="$4" i_tracknumber="$5" i_discnumber="$6"
-    local outputfile="" record_fifo="" ext
+    local finalfile="" record_fifo="" ext
 
     [[ -z "$i_title" || -z "$i_artist" ]] && return 1
 
     ext="m4a"
     [[ "$record_format" == "ogg" ]] && ext="oga"
-    outputfile="$(file_path_structure "$i_artist" "$i_album" "$i_title" "$ext")"
+    # finalfile is the destination the finished file is moved to; the encoder
+    # writes to a temp file first (record_temp_file, set below). Computing the
+    # final path now also creates the destination dir and uniquifies the name.
+    finalfile="$(file_path_structure "$i_artist" "$i_album" "$i_title" "$ext")"
     stop_current_recording
 
     if ! ensure_target_routed; then
@@ -1928,7 +1992,10 @@ start_recording () {
         return 1
     fi
 
-    log_debug "encoder command: format=$record_format aac_profile=$aac_profile bitrate=${bitrate}k output=$outputfile"
+    # Capture into system temp; moved to finalfile once the encoder finalizes.
+    record_temp_file="$(mktemp -p "$rec_temp_dir" recXXXXXX)"
+
+    log_debug "encoder command: format=$record_format aac_profile=$aac_profile bitrate=${bitrate}k temp=$record_temp_file output=$finalfile"
 
     # OGG (unlike MP4/AAC) genuinely supports multiple ARTIST= comment
     # fields on one file. "oggenc --artist" doesn't add one, though - it
@@ -1955,13 +2022,13 @@ start_recording () {
             fdkaac -R -S -p "$aac_profile" --bitrate "${bitrate}k" --moov-before-mdat --afterburner 1 \
                 --title "$i_title" --artist "$i_artist" --album "$i_album" --album-artist "$i_albumartist" \
                 --track "$i_tracknumber" --disk "$i_discnumber" \
-                - -o "$outputfile" < "$record_fifo" 2>"$record_error_log" &
+                - -o "$record_temp_file" < "$record_fifo" 2>"$record_error_log" &
             encoder_pid=$!
             ;;
         ogg)
             oggenc -b "$bitrate" --raw \
                 --title "$i_title" "${ogg_artist_args[@]}" --album "$i_album" --tracknum "$i_tracknumber" \
-                - -o "$outputfile" < "$record_fifo" 2>"$record_error_log" &
+                - -o "$record_temp_file" < "$record_fifo" 2>"$record_error_log" &
             encoder_pid=$!
             ;;
         *)
@@ -1982,7 +2049,8 @@ start_recording () {
         [[ -s "$record_error_log" ]] && err="$(tr '\n' ' ' < "$record_error_log")"
         kill "$parec_pid" "$encoder_pid" 2>/dev/null || true
         stop_current_recording
-        [[ -n "$outputfile" ]] && rm -f "$outputfile"
+        [[ -n "$record_temp_file" ]] && rm -f "$record_temp_file"
+        record_temp_file=""
         recording_failed=true; status_dirty=1
         log_line "recorder failed to start: ${err:-check codec dependencies and format settings}"
         return 1
@@ -1990,7 +2058,6 @@ start_recording () {
 
     # shellcheck disable=SC2034  # recording_failed/status_dirty are read by the active profile module's recording_screen_render()
     recording_failed=false; status_dirty=1
-    tui_set "output" "$outputfile"
 
     # Logged once this recording actually stops (see stop_current_recording),
     # so the log entry can include the real capture duration.
@@ -2000,7 +2067,7 @@ start_recording () {
     record_log_title="$i_title"
     record_log_tracknumber="$i_tracknumber"
     record_log_discnumber="$i_discnumber"
-    record_log_file="$outputfile"
+    record_log_file="$finalfile"
     return 0
 }
 
@@ -2057,6 +2124,11 @@ remove_null_sink () {
 cleanup () {
     # "drain" so a manual quit mid-track still finalizes the current file.
     stop_current_recording "drain"
+    # Wait for every backgrounded temp->final move (this session's track changes
+    # plus the drain above) so no completed recording is lost when the process
+    # exits, then discard the now-empty session temp dir.
+    [[ ${#finalizer_pids[@]} -gt 0 ]] && wait "${finalizer_pids[@]}" 2>/dev/null
+    [[ -n "$rec_temp_dir" && -d "$rec_temp_dir" ]] && rm -rf "$rec_temp_dir"
     if declare -F profile_cleanup >/dev/null 2>&1; then
         profile_cleanup
     fi
