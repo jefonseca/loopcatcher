@@ -489,6 +489,100 @@ test_start_recording_routing_failure_sets_recording_failed () {
     [[ "$out" == "true" ]]
 }
 
+test_start_recording_captures_to_temp_not_final () {
+    local out tmpdir
+    tmpdir="$(mktemp -d)"
+    # shellcheck disable=SC2034
+    out="$({
+        source_with_spotify_native
+        # shellcheck disable=SC2317
+        ensure_target_routed () { return 0; }
+        # shellcheck disable=SC2317
+        oggenc () { printf '%s\n' "$@" > "$tmpdir/oggenc.args"; sleep 5; }
+        # shellcheck disable=SC2317
+        parec () { sleep 5; }
+        rec_temp_dir="$tmpdir/rectmp"; mkdir -p "$rec_temp_dir"
+        session_output_directory="$tmpdir/out"
+        record_format="ogg"
+        start_recording "Artist" "Album" "Song" "Artist" "1" "1" >/dev/null 2>&1
+        sleep 0.3
+        # The encoder's -o argument is the line right after "-o".
+        oarg="$(grep -A1 '^-o$' "$tmpdir/oggenc.args" | tail -1)"
+        # Encoder writes to the temp file under rec_temp_dir; nothing has landed
+        # at the final destination yet (the move happens only on finalize).
+        [[ "$oarg" == "$record_temp_file" && "$record_temp_file" == "$rec_temp_dir"/* ]] && printf 'TEMP '
+        [[ -e "$session_output_directory/Artist/Album/Song.oga" ]] && printf 'FINAL_EXISTS'
+    })"
+    rm -rf "$tmpdir"
+
+    [[ "$out" == "TEMP " ]]
+}
+
+test_finalize_recording_moves_temp_to_final () {
+    local out tmpdir
+    tmpdir="$(mktemp -d)"
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        temp="$tmpdir/rec123"; printf 'AUDIO' > "$temp"
+        final="$tmpdir/out/Artist/Album/Song.oga"
+        # Empty encoder PID = "already finished": moves immediately.
+        _finalize_recording "" "$temp" "$final"
+        printf 'final=%s|temp_gone=%s|content=%s' \
+            "$([[ -f "$final" ]] && echo yes || echo no)" \
+            "$([[ -e "$temp" ]] && echo no || echo yes)" \
+            "$(cat "$final" 2>/dev/null)"
+    })"
+    rm -rf "$tmpdir"
+
+    [[ "$out" == "final=yes|temp_gone=yes|content=AUDIO" ]]
+}
+
+test_finalize_recording_does_not_clobber_existing_final () {
+    local out tmpdir
+    tmpdir="$(mktemp -d)"
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        log_level=0
+        mkdir -p "$tmpdir/out"
+        printf 'OLD' > "$tmpdir/out/Song.oga"
+        temp="$tmpdir/rec123"; printf 'NEW' > "$temp"
+        _finalize_recording "" "$temp" "$tmpdir/out/Song.oga"
+        # The existing file is untouched; the move re-uniquifies to _2.
+        printf 'orig=%s|moved=%s' \
+            "$(cat "$tmpdir/out/Song.oga")" \
+            "$(cat "$tmpdir/out/Song_2.oga" 2>/dev/null)"
+    })"
+    rm -rf "$tmpdir"
+
+    [[ "$out" == "orig=OLD|moved=NEW" ]]
+}
+
+test_stop_current_recording_spawns_finalizer_and_clears_paths () {
+    local out tmpdir
+    tmpdir="$(mktemp -d)"
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        log_level=0
+        parec_pid=""; encoder_pid=""
+        record_temp_file="$tmpdir/rec123"; printf 'AUDIO' > "$record_temp_file"
+        record_log_file="$tmpdir/out/Song.oga"
+        record_start_seconds=$SECONDS
+        stop_current_recording
+        wait "${finalizer_pids[@]}" 2>/dev/null
+        # One move was queued, the in-flight paths were cleared, and the file
+        # actually landed at its final destination.
+        printf 'count=%s|temp=%s|log=%s|moved=%s' \
+            "${#finalizer_pids[@]}" "$record_temp_file" "$record_log_file" \
+            "$([[ -f "$tmpdir/out/Song.oga" ]] && echo yes || echo no)"
+    })"
+    rm -rf "$tmpdir"
+
+    [[ "$out" == "count=1|temp=|log=|moved=yes" ]]
+}
+
 test_list_profile_modules_finds_shipped_modules () {
     local out
     out="$({ source "$SCRIPT_PATH"; list_profile_modules; })"
@@ -1245,6 +1339,10 @@ main () {
     run_test test_stop_recording_cleans_up
     run_test test_cancel_and_exit_exits_zero
     run_test test_start_recording_routing_failure_sets_recording_failed
+    run_test test_start_recording_captures_to_temp_not_final
+    run_test test_finalize_recording_moves_temp_to_final
+    run_test test_finalize_recording_does_not_clobber_existing_final
+    run_test test_stop_current_recording_spawns_finalizer_and_clears_paths
     run_test test_list_profile_modules_finds_shipped_modules
     run_test test_default_profile_fallback_prefers_marked_module
     run_test test_load_config_falls_back_to_default_marked_module_when_invalid
