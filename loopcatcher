@@ -251,7 +251,7 @@ use_system_temp="yes"
 aac_profile="29"
 bitrate="48"
 record_format="aac"
-filename_scheme="normal"
+filename_scheme="stream"
 output_directory=""
 # Extra capture time (seconds) kept running after the player reports pause/stop
 # so the audio tail still in the sink -> parec -> pipe -> encoder chain is
@@ -919,7 +919,7 @@ _validate_settings () {
         *) t err.invalid_record_format "$record_format"; return 1 ;;
     esac
     case "$filename_scheme" in
-        normal|strict|strict-lc-nodir) ;;
+        normal|strict|stream) ;;
         *) t err.invalid_filename_scheme "$filename_scheme"; return 1 ;;
     esac
     if ! _profile_available "$default_profile"; then
@@ -1383,6 +1383,39 @@ _cfg_edit_choice () {
     done
 }
 
+# Friendly, translated display name for a filename_scheme value. Unlike every
+# other choice setting (whose stored token IS what the user sees, so a plain
+# _cfg_edit_choice suffices), filename_scheme shows a human label while storing
+# a stable lowercase token - so it needs a value->label lookup, used both by the
+# Paths menu row and edit_filename_scheme below.
+_filename_scheme_label () {
+    t "config.paths.filename_scheme.$1"
+}
+
+# Bespoke chooser for filename_scheme: presents the translated labels but stores
+# the stable token behind the chosen label (the parallel value/label + index
+# dispatch pattern, same shape change_profile_screen uses). Kept separate from
+# _cfg_edit_choice, which stays generic and shows raw tokens. Every offered
+# value is valid by construction, so there is no validation-retry loop.
+edit_filename_scheme () {
+    local -a values=(normal strict stream)
+    local -a labels=()
+    local v i choice
+    for v in "${values[@]}"; do labels+=("$(_filename_scheme_label "$v")"); done
+
+    render_page "$(t config.title)"
+    ui_gap
+    choice="$(gum choose --header "$(t config.paths.filename_scheme_prompt)" \
+        --cursor="$UI_CURSOR" --selected "$(_filename_scheme_label "$filename_scheme")" -- "${labels[@]}")" || return 0
+    for i in "${!labels[@]}"; do
+        [[ "$choice" == "${labels[$i]}" ]] || continue
+        filename_scheme="${values[$i]}"
+        save_config
+        config_changed=true
+        return 0
+    done
+}
+
 config_group_codecs () {
     local choice i
     local -a ids=(record_format aac_profile bitrate back)
@@ -1415,7 +1448,7 @@ config_group_paths () {
     while true; do
         local -a items=(
             "$(t config.paths.output_folder "$output_directory")"
-            "$(t config.paths.filename_scheme "$filename_scheme")"
+            "$(t config.paths.filename_scheme "$(_filename_scheme_label "$filename_scheme")")"
             "$(t config.paths.log_file "$(effective_log_file_path)")"
             "$(t common.back)"
         )
@@ -1430,7 +1463,7 @@ config_group_paths () {
                         && [[ -n "$d" ]] && { output_directory="$d"; mkdir -p -- "$output_directory"; save_config; config_changed=true; }
                     ;;
                 filename_scheme)
-                    _cfg_edit_choice filename_scheme "$(t config.paths.filename_scheme_prompt)" normal strict strict-lc-nodir
+                    edit_filename_scheme
                     ;;
                 log_file)
                     _cfg_edit_input log_file_path "$(t config.paths.log_file_prompt "${TMPDIR:-/tmp}/loopcatcher/<session>.log")"
@@ -1852,12 +1885,15 @@ file_path_structure () {
             outdir="$session_output_directory/$(_portable_component "$(sanitize_str "strict" "$i_artist")")/$(_portable_component "$(sanitize_str "strict" "$i_album")")"
             outfile="$(_portable_component "$(sanitize_str "strict" "$i_title")").$extension"
             ;;
-        strict-lc-nodir)
-            # The three parts are joined FIRST and the whole basename capped:
-            # three individually-legal parts still add up to one illegally
-            # long file name, and here they are one name, not three.
+        stream)
+            # Flat single-folder layout for an online-radio capture: every file
+            # lands directly in the session dir as "artist_title". The album is
+            # deliberately omitted. The two parts are joined FIRST and the whole
+            # basename capped, since two individually-legal parts can still add
+            # up to one illegally long file name - here they are one name, not
+            # two. First artist only, like every other scheme.
             outdir="$session_output_directory"
-            outfile="$(_portable_component "$(sanitize_str "strict-lc" "$i_artist")_$(sanitize_str "strict-lc" "$i_album")_$(sanitize_str "strict-lc" "$i_title")").$extension"
+            outfile="$(_portable_component "$(sanitize_str "strict-lc" "$i_artist")_$(sanitize_str "strict-lc" "$i_title")").$extension"
             ;;
         *)
             # Unreachable: filename_scheme is validated at startup.

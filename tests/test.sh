@@ -173,13 +173,36 @@ test_strict_schemes_fall_back_when_metadata_has_no_ascii () {
         session_output_directory="$tmpdir"
         filename_scheme="strict"
         strict="$(file_path_structure "日本語バンド" "アルバム" "曲名" "m4a")"
-        filename_scheme="strict-lc-nodir"
+        filename_scheme="stream"
         nodir="$(file_path_structure "日本語バンド" "アルバム" "曲名" "m4a")"
         printf '%s|%s' "${strict#"$tmpdir"}" "${nodir#"$tmpdir"}"
     })"
     rm -rf "$tmpdir"
 
-    [[ "$out" == "/Unknown/Unknown/Unknown.m4a|/unknown_unknown_unknown.m4a" ]]
+    # stream drops the album, so only artist+title fall back (two parts, not three).
+    [[ "$out" == "/Unknown/Unknown/Unknown.m4a|/unknown_unknown.m4a" ]]
+}
+
+test_stream_scheme_drops_album () {
+    local out tmpdir
+    tmpdir="$(mktemp -d)"
+    out="$({
+        source "$SCRIPT_PATH"
+        session_output_directory="$tmpdir"
+        filename_scheme="stream"
+        file_path_structure "Artist" "Album" "Song" "m4a"
+    })"
+    rm -rf "$tmpdir"
+
+    # Flat, lowercased, album omitted, no artist/album subdirs.
+    [[ "$out" == "$tmpdir/artist_song.m4a" ]]
+}
+
+test_default_filename_scheme_is_stream () {
+    local out
+    out="$({ source "$SCRIPT_PATH"; printf '%s' "$filename_scheme"; })"
+
+    [[ "$out" == "stream" ]]
 }
 
 # Names Linux accepts but Windows/macOS/FAT do not: over-long components, and
@@ -809,6 +832,7 @@ test_validate_settings_rejects_every_invalid_field () {
         validate_settings_soft >/dev/null 2>&1 || printf 'BASELINE-INVALID '
         _expect_rejected record_format      "flac"
         _expect_rejected filename_scheme    "fancy"
+        _expect_rejected filename_scheme    "strict-lc-nodir"   # renamed to "stream"; old token no longer valid
         _expect_rejected default_profile    "bogus_module"
         _expect_rejected bitrate            "0"
         _expect_rejected aac_profile        "abc"
@@ -1368,6 +1392,8 @@ main () {
     run_test test_start_recording_ogg_writes_all_artists_as_separate_fields
     run_test test_maybe_start_recording_waits_for_full_metadata_burst
     run_test test_strict_schemes_fall_back_when_metadata_has_no_ascii
+    run_test test_stream_scheme_drops_album
+    run_test test_default_filename_scheme_is_stream
     run_test test_portable_component_caps_length_and_reserved_names
     run_test test_portable_component_respects_byte_limit
     run_test test_normal_scheme_keeps_unicode
