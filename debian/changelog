@@ -1,3 +1,15 @@
+loopcatcher (0.4.0-1) unstable; urgency=medium
+
+  * Never record in place: each track is captured to a temporary file and
+    moved to its final location only once complete. A new "Record via System
+    Temp" setting (Advanced, on by default) chooses between the system temp
+    directory and a "partial_recording" folder in the output directory.
+  * Rework the filename schemes with friendly names and add "Stream
+    Collection", a new flat single-folder layout (artist_title, album
+    omitted) for online-radio captures - now the default.
+
+ -- Kike Fonseca <filipok@gmail.com>  Mon, 07 Sep 2026 12:00:00 +0000
+
 loopcatcher (0.3.1-1) unstable; urgency=medium
 
   * Fix track, album and artist names being cut off at the first quote
