@@ -16,7 +16,9 @@ reports.
 - **One file per track**, split automatically — never one long recording.
 - **Tagged as it records**: artist, album, album artist, title, track/disc
   number written into the file itself.
-- **Organized output**: `Music/<session>/<Artist>/<Album>/<Title>.m4a`.
+- **Flexible output layout**: a flat `Music/<session>/artist_title.m4a` by
+  default, or a browsable `Artist/Album/Title` tree — your pick (see
+  [Filename scheme](#filename-scheme)).
 - **AAC (`.m4a`) or OGG (`.oga`)**, bitrate and AAC profile of your choosing.
 - **Fully interactive** — a guided flow, no flags to memorize.
 - **English and Spanish**, following your system locale by default.
@@ -188,6 +190,23 @@ can't represent a list:
 - **OGG (`.oga`)** — every artist gets its own `ARTIST=` tag.
 - **AAC (`.m4a`)** — only the first artist is tagged; MP4's artist atom holds
   a single value.
+
+### Filename scheme
+
+How each track is named and laid out on disk is set in Settings →
+**Paths → Filename Scheme**. Three schemes are offered:
+
+- **Stream Collection** *(default)* — a flat, single-folder layout meant for
+  online-radio style captures: every track lands directly in the session folder
+  as `artist_title`, lower-cased and reduced to plain ASCII. No per-artist or
+  per-album subfolders, and the album is left out of the name.
+- **Music Collection** — a browsable `Artist/Album/Title` tree that keeps the
+  original names (accents and non-Latin scripts intact).
+- **Music Collection with sanitized names** — the same `Artist/Album/Title`
+  tree, but reduced to plain ASCII letters and digits for maximum portability.
+
+Whichever you pick, output goes under `Music/<session>/` and every name is made
+portable before it is written (see below).
 
 ### Portable names
 
