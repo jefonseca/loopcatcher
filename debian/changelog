@@ -1,3 +1,15 @@
+loopcatcher (0.4.1-1) unstable; urgency=medium
+
+  * Fix long sessions silently capturing digital silence when the player's
+    audio stream was rebuilt mid-track: routing is now re-checked every
+    second instead of only at track changes, and a stuck capture is logged.
+  * Number "Stream Collection" files in capture order (0001_artist_title...)
+    so a long playlist can be resumed with a new "Start numbering from"
+    setting after an interrupted session.
+  * Session logging is now on by default.
+
+ -- Kike Fonseca <filipok@gmail.com>  Fri, 11 Sep 2026 12:00:00 +0000
+
 loopcatcher (0.4.0-1) unstable; urgency=medium
 
   * Never record in place: each track is captured to a temporary file and

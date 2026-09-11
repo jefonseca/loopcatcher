@@ -26,6 +26,7 @@ MSG_en[spotify_native.field.sink_app_name]='Sink App Name'
 MSG_en[spotify_native.field.mpris_bus]='MPRIS Bus'
 MSG_en[spotify_native.field.mpris_wait_timeout_seconds]='MPRIS Wait Timeout (seconds)'
 MSG_en[spotify_native.field.sink_match]='Sink Match (space-separated globs)'
+MSG_en[spotify_native.field.stream_start_number]='Start numbering from (1-9999)'
 
 # --- Requirements screen (requirements_screen()) ---
 MSG_en[spotify_native.requirements.attention]='READ THIS BEFORE CONTINUING!!!'
@@ -67,6 +68,7 @@ MSG_en[spotify_native.wizard.sink_line1]='Waiting for the capture sink - can tak
 MSG_en[spotify_native.url.intro]='Paste the Spotify link you want to record (track/album/playlist).'
 MSG_en[spotify_native.url.instruction]='Supported: track, album, and playlist links from open.spotify.com.'
 MSG_en[spotify_native.url.input_header]='Spotify URL'
+MSG_en[spotify_native.error.invalid_stream_start_number]='Invalid start number: %s (allowed: 1 to 9999)'
 MSG_en[spotify_native.error.invalid_url]="That is not a valid Spotify link. Please try again."
 
 # --- Recording screen (recording_screen_render()) ---

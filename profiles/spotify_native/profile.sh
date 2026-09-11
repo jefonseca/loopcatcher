@@ -61,6 +61,7 @@ dbus_monitor_pid=""
 playbackstatus="Unknown"
 started_playing=false
 player_missing_polls=0    # consecutive liveness polls with the player bus gone
+capture_silent_polls=0    # consecutive polls with no live audio on the capture sink
 active_recording_signature=""
 trackid=""
 last_trackid=""
@@ -103,6 +104,7 @@ profile_config_schema () {
     printf 'spotify_native_mpris_bus\t%s\t%s\tinput\n' "$(t spotify_native.field.mpris_bus)" "$SPOTIFY_NATIVE_MPRIS_BUS"
     printf 'spotify_native_mpris_wait_timeout_seconds\t%s\t15\tinput\n' "$(t spotify_native.field.mpris_wait_timeout_seconds)"
     printf 'spotify_native_sink_match\t%s\t%s\tinput\n' "$(t spotify_native.field.sink_match)" "$SPOTIFY_NATIVE_SINK_MATCH"
+    printf 'spotify_native_stream_start_number\t%s\t1\tinput\n' "$(t spotify_native.field.stream_start_number)"
 }
 
 profile_apply_defaults () {
@@ -111,20 +113,66 @@ profile_apply_defaults () {
     spotify_native_mpris_bus="$SPOTIFY_NATIVE_MPRIS_BUS"
     spotify_native_mpris_wait_timeout_seconds="15"
     spotify_native_sink_match="$SPOTIFY_NATIVE_SINK_MATCH"
+    spotify_native_stream_start_number="1"
     profile_activate
 }
 
 # Copies this module's persisted, prefixed vars into the generic unprefixed
 # runtime vars that the main script's sink-detection/routing functions
-# (get_target_sink_index, is_target_sink_app, ensure_target_routed) already
-# read. Even though this module routes Spotify's audio at launch time (via
-# PULSE_SINK, see launch_spotify() below), start_recording() still calls
-# ensure_target_routed() on every track, which needs source_sink_index -
-# populated only via get_target_sink_index(), which needs these two fields.
+# (_target_sink_inputs, is_target_sink_app, ensure_target_routed) already read.
+# Even though this module routes Spotify's audio at launch time in managed mode
+# (via PULSE_SINK, see launch_spotify() below), start_recording() and the
+# capture-route poll both still call ensure_target_routed(), which identifies
+# the player's streams by these two fields on every call - it caches nothing.
 profile_activate () {
     sink_app_name="$spotify_native_sink_app_name"
     player_mpris_bus="$spotify_native_mpris_bus"
     player_sink_match="$spotify_native_sink_match"
+    # Where the "stream" scheme's file numbering starts. Only attached mode
+    # offers the choice: there the user cues the playlist by hand and may be
+    # resuming a run that was cut off, so the numbering has to be able to pick
+    # up where the last session stopped. In managed mode loopcatcher opens the
+    # playlist itself, from the top, so it always starts at 1.
+    #
+    # Normalised here, at the boundary, and never at the point of use: the
+    # value arrives verbatim from a config line or a gum input, and bash reads
+    # a leading zero as OCTAL in arithmetic - "0050" would number the first
+    # file 0040, and "0090" is not valid octal at all, so printf '%04d' would
+    # fail outright on every track. "10#" forces base 10, and the =~ guard has
+    # to come first: $((10#abc)) is a hard arithmetic error, not a fallback.
+    stream_start_number=1
+    if [[ "$spotify_native_manage_player" == "no" \
+       && "$spotify_native_stream_start_number" =~ ^[0-9]+$ ]] \
+       && (( 10#$spotify_native_stream_start_number >= 1 \
+          && 10#$spotify_native_stream_start_number <= 9999 )); then
+        stream_start_number=$((10#$spotify_native_stream_start_number))
+    fi
+}
+
+# A field that only makes sense under some other setting. "Start numbering
+# from" numbers files in the flat, single-folder "stream" scheme, so it has
+# nothing to say under the Music Collection schemes, and nothing to offer in
+# managed mode, where the playlist always starts at the top.
+profile_field_visible () {
+    case "$1" in
+        spotify_native_stream_start_number)
+            [[ "$spotify_native_manage_player" == "no" && "$filename_scheme" == "stream" ]]
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+# This module's own settings, checked the way the main script checks its
+# generic ones: print the message, return non-zero.
+profile_validate_settings () {
+    local n="$spotify_native_stream_start_number"
+    # "10#" forces base 10 in the arithmetic below - a value the user typed as
+    # "0050" is otherwise read as octal, and "0090" is not even valid octal.
+    if [[ ! "$n" =~ ^[0-9]+$ ]] || (( 10#$n < 1 || 10#$n > 9999 )); then
+        t spotify_native.error.invalid_stream_start_number "$n"
+        return 1
+    fi
+    return 0
 }
 
 # Required by the 7-hook contract, but genuinely unused: this module never
@@ -183,6 +231,39 @@ poll_player_liveness () {
     active_recording_signature=""
     log_line "player exited"
     end_session
+}
+
+# Called by the main loop on the same timer as poll_player_liveness, but only
+# while a recording is actually running. Two jobs, one pactl pass:
+#
+#   1. Re-assert routing. The player can rebuild its audio stream in the middle
+#      of a track - after an audio-device change, a buffering stall, or simply
+#      on its own - and the new stream lands wherever the session manager sends
+#      it, normally the speakers. MPRIS announces none of that. Routing used to
+#      be asserted only at a track change, so the rest of that track was
+#      captured off an idle monitor and encoded as full-length digital silence.
+#      Re-asserting here caps the damage at about a second.
+#   2. Report it. If nothing uncorked is feeding the capture sink for three
+#      consecutive polls, the capture is recording silence and the log says so
+#      once per episode (and once more when audio comes back), which is the
+#      only trace a long unattended session leaves of a track that came out
+#      mute. Three polls, not one, because a stream is legitimately corked for
+#      a moment at a track boundary.
+poll_capture_route () {
+    [[ $should_exit -eq 0 && -n "$active_recording_signature" ]] || return 0
+
+    ensure_target_routed || true
+
+    if [[ "$capture_route_live" == "true" ]]; then
+        [[ $capture_silent_polls -ge 3 ]] \
+            && log_line "audio is reaching capture sink '$nulloutput_name' again (title=\"$title\")"
+        capture_silent_polls=0
+        return 0
+    fi
+
+    capture_silent_polls=$((capture_silent_polls + 1))
+    [[ $capture_silent_polls -eq 3 ]] || return 0
+    log_line "no live player stream on capture sink '$nulloutput_name' - capturing silence (title=\"$title\")"
 }
 
 # One-shot PlaybackStatus query (used by the wizard before the coproc exists).
@@ -663,6 +744,7 @@ recording_main_loop () {
         if [[ $should_exit -eq 0 && $(( SECONDS - last_liveness )) -ge 1 ]]; then
             last_liveness=$SECONDS
             poll_player_liveness
+            poll_capture_route
             # Recover a missed Metadata burst: if playback is running but nothing
             # is recording yet, the "Playing" signal arrived without usable
             # metadata (or its burst never reached us). maybe_start_recording
@@ -753,8 +835,8 @@ _run_managed () {
     # wizard_step_screen already special-cases (an unbounded retry loop, not a
     # single attempt). This closes the buffering/loading gap between
     # "MPRIS says Playing" and "the PulseAudio stream actually exists" -
-    # ensure_target_routed()'s own retry inside start_recording is a single
-    # attempt, so leaving this to chance made the very first track's
+    # ensure_target_routed()'s own retry inside start_recording only covers
+    # about a second, so leaving a cold start to it made the very first track's
     # recording fail outright whenever the sink-input hadn't registered yet.
     if ! get_target_sink_index; then
         wizard_step_screen 1 sink "$(t spotify_native.wizard.sink_heading)" \

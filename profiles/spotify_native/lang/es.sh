@@ -17,6 +17,7 @@ MSG_es[spotify_native.field.sink_app_name]='Nombre de la App del Sink'
 MSG_es[spotify_native.field.mpris_bus]='Bus MPRIS'
 MSG_es[spotify_native.field.mpris_wait_timeout_seconds]='Tiempo de Espera MPRIS (segundos)'
 MSG_es[spotify_native.field.sink_match]='Coincidencia de Sink (globs separados por espacios)'
+MSG_es[spotify_native.field.stream_start_number]='Empezar numeración desde (1-9999)'
 
 # --- Pantalla de Requisitos (requirements_screen()) ---
 MSG_es[spotify_native.requirements.attention]='LEA ESTO ANTES DE CONTINUAR!!!'
@@ -58,6 +59,7 @@ MSG_es[spotify_native.wizard.sink_line1]='Esperando el sink de captura - puede t
 MSG_es[spotify_native.url.intro]='Pega el enlace de Spotify que quieres grabar (canción/álbum/lista).'
 MSG_es[spotify_native.url.instruction]='Soportado: enlaces de canción, álbum y lista de open.spotify.com.'
 MSG_es[spotify_native.url.input_header]='URL de Spotify'
+MSG_es[spotify_native.error.invalid_stream_start_number]='Número de inicio no válido: %s (permitido: 1 a 9999)'
 MSG_es[spotify_native.error.invalid_url]='Ese enlace de Spotify no es válido. Inténtalo de nuevo.'
 
 # --- Pantalla de Grabación (recording_screen_render()) ---

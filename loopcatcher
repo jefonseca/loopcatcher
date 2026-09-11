@@ -232,7 +232,11 @@ load_lang_dir "$(lang_root)"
 
 # --- persisted to the config file ---
 # 0 = no log written at all, 1 = normal session log, 2 = adds encoder diagnostics.
-log_level="0"
+# Default 1: a capture session is typically long and unattended, so the one
+# artifact that can explain afterwards what happened - which tracks were
+# captured, how long each took, whether audio ever stopped reaching the capture
+# sink - has to exist without the user having thought to turn it on first.
+log_level="1"
 # Directory name (under profiles/) of the active profile module. Left empty
 # here on purpose (set -u still needs SOME value): profiles_root()/
 # list_profile_modules() - which pick the real fallback - aren't callable
@@ -291,6 +295,13 @@ session_log_path=""
 
 # --- sink routing ---
 source_sink_index=""
+# True while at least one uncorked stream of the target player sits on the
+# capture sink - i.e. audio really is reaching what parec records. Set by
+# ensure_target_routed(), watched by the active module's capture-route poll.
+# It exists because an idle monitor is NOT an error for parec: it reads back a
+# valid, full-length stream of zeroes, so a capture that has lost its audio
+# looks exactly like a good one until the file is played back.
+capture_route_live=false
 
 # --- generic, unprefixed runtime vars populated by the active profile
 # module's profile_activate() (see "Profile modules" below). Read by the
@@ -300,6 +311,12 @@ sink_app_name=""
 # shellcheck disable=SC2034  # read by the active profile module (e.g. spotify_native's MPRIS calls), not by this file
 player_mpris_bus=""
 player_sink_match=""
+# Number the first file of a "stream" session gets. 1 unless the active module
+# says otherwise (spotify_native only offers the choice in attached mode, where
+# the user cues the playlist by hand and may be resuming an interrupted run).
+# Declared with a working default, not empty, because file_path_structure does
+# arithmetic on the counter seeded from it.
+stream_start_number=1
 
 # Every extra artist value a profile module's monitor collects for a track
 # (start_recording, generic, uses this for OGG's multi-ARTIST= tagging) -
@@ -331,6 +348,11 @@ record_log_title=""
 record_log_tracknumber=""
 record_log_discnumber=""
 record_log_file=""
+# Sequence number of the NEXT capture, consumed by the "stream" filename scheme
+# and advanced by start_recording once a capture has actually begun. Seeded from
+# stream_start_number in init_session_log; the declaration here keeps it usable
+# when file_path_structure is called directly (as the tests do).
+stream_counter=1
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 config_dir="$XDG_CONFIG_HOME/loopcatcher"
@@ -716,6 +738,12 @@ init_session_log () {
     fi
     mkdir -p -- "$rec_temp_dir" 2>/dev/null
 
+    # The "stream" scheme numbers files in capture order. Seeded here, once per
+    # session, because this is the one per-session init that runs in the main
+    # shell - file_path_structure itself is always called inside "$( )", where
+    # any advance it made would be discarded with the subshell.
+    stream_counter="$stream_start_number"
+
     [[ "$log_level" -ge 1 ]] || return 0
     session_log_path="$(effective_log_file_path)"
     mkdir -p -- "$(dirname "$session_log_path")" 2>/dev/null
@@ -802,6 +830,29 @@ _profile_schema_keys () {
     profile_config_schema | cut -f1
 }
 
+# Sets each named key to the default the module's own schema declares for it.
+# Reads profile_config_schema directly rather than going through
+# _profile_schema_rows, which is the UI view of the schema and hides fields the
+# module says do not apply - seeding has to cover every key the module persists,
+# visible or not, or save_config would later dereference an unset one.
+_seed_missing_profile_keys () {
+    local wanted=" $* " line key rest default
+    declare -F profile_config_schema >/dev/null 2>&1 || return 0
+    while IFS= read -r line; do
+        key="${line%%$'\t'*}"
+        [[ -n "$key" && "$wanted" == *" $key "* ]] || continue
+        # Third tab-separated field, peeled by hand rather than read into
+        # "IFS=$'\t' read -r key label default": a tab is IFS *whitespace*, so
+        # read collapses a run of them and an empty label or default would
+        # silently shift every later field left - seeding the key with the
+        # schema's "kind" instead of its default.
+        rest="${line#*$'\t'}"
+        rest="${rest#*$'\t'}"
+        default="${rest%%$'\t'*}"
+        printf -v "$key" '%s' "$default"
+    done < <(profile_config_schema)
+}
+
 # Reads the whole config file exactly once per process, from main(). Every
 # Settings/Profile Settings edit after that still validates and saves to disk
 # immediately, but never calls this again - see "Settings edits" below and
@@ -845,18 +896,30 @@ load_config () {
 
     load_profile_module "$default_profile" || return 1
 
-    # If none of the active module's schema-declared keys were already set by
-    # the sourced file, this is its first use - seed it from the module's
-    # own defaults and persist immediately, so the file gains that module's
-    # full prefixed section (see profile_config_schema/profile_apply_defaults).
-    local needs_seed=0 key
+    # Which of the active module's schema-declared keys the sourced file did not
+    # set. The distinction between "none of them" and "some of them" matters:
+    #
+    #   none  - first use of this module. profile_apply_defaults() owns the whole
+    #           section, exactly as documented for that hook.
+    #   some  - the module GREW a key since this config file was written. Filling
+    #           only the gaps is the whole point: calling profile_apply_defaults()
+    #           here would reset every setting the user had customised - including
+    #           which capture mode they run in - the first time they launched a
+    #           newer build, silently and persisted straight to disk.
+    local key total=0
+    local -a missing=()
     while IFS= read -r key; do
         [[ -n "$key" ]] || continue
-        [[ -v "$key" ]] || { needs_seed=1; break; }
+        total=$((total + 1))
+        [[ -v "$key" ]] || missing+=("$key")
     done < <(_profile_schema_keys)
 
-    if [[ $needs_seed -eq 1 ]]; then
+    if [[ $total -gt 0 && ${#missing[@]} -eq $total ]]; then
         profile_apply_defaults
+        save_config
+    elif [[ ${#missing[@]} -gt 0 ]]; then
+        _seed_missing_profile_keys "${missing[@]}"
+        profile_activate
         save_config
     else
         profile_activate
@@ -946,6 +1009,14 @@ _validate_settings () {
         auto|en|es) ;;
         *) t err.invalid_language "$language"; return 1 ;;
     esac
+    # Optional hook: the active module validates its own prefixed keys, which
+    # this function knows nothing about. Same contract as the checks above -
+    # print the message, return non-zero - so a bad module value is rejected by
+    # _cfg_edit_input's existing retry loop and by the startup check, instead of
+    # being silently swallowed at its use site.
+    if declare -F profile_validate_settings >/dev/null 2>&1; then
+        profile_validate_settings || return 1
+    fi
     return 0
 }
 
@@ -1236,9 +1307,23 @@ $(t profile.change.header)"
 _profile_schema_rows () {
     schema_keys=(); schema_labels=(); schema_kinds=(); schema_choices=()
     local key label default kind choices
-    # shellcheck disable=SC2034  # "default" is positional-only here - profile_apply_defaults() is what actually applies it
+    # shellcheck disable=SC2034  # "default" is positional-only here - profile_apply_defaults() and _seed_missing_profile_keys() are what actually apply it
+    # Do NOT start using "default" from this loop: a tab is IFS whitespace, so
+    # this read collapses a run of tabs and an empty label would shift every
+    # later field left. It is harmless while the value is only a placeholder.
+    # _seed_missing_profile_keys(), which does need the real value, peels the
+    # fields by hand for exactly that reason.
     while IFS=$'\t' read -r key label default kind choices; do
         [[ -n "$key" ]] || continue
+        # Optional hook: a module can declare a field that only applies under
+        # some other setting. Filtered HERE rather than where the menu is built,
+        # because profile_settings_screen dispatches by matching menu_items[i]
+        # against schema_keys[i] - skipping a row downstream would shift the
+        # indices apart and edit the wrong field. The key stays in the schema
+        # (and so in the config file) either way; only the row is hidden.
+        if declare -F profile_field_visible >/dev/null 2>&1; then
+            profile_field_visible "$key" || continue
+        fi
         schema_keys+=("$key")
         schema_labels+=("$label")
         schema_kinds+=("$kind")
@@ -1656,44 +1741,123 @@ is_target_sink_app () {
     return 1
 }
 
-# Sets source_sink_index. Returns: 0 matched, 2 no sink-inputs, 3 none matched.
-get_target_sink_index () {
-    local sink_list sink_index="" sink_app="" line
-
-    sink_list="$(pactl list sink-inputs 2>/dev/null)"
-    [[ -z "$sink_list" ]] && return 2
+# Every sink-input belonging to the target player, one "index<TAB>sink<TAB>corked"
+# line each, in pactl's own (ascending index) order. ONE pactl pass answers both
+# questions the routing code has - where is the player playing, and is anything
+# actually feeding our capture sink - so the two can never disagree.
+#
+# LC_ALL=C is load-bearing: pactl translates its own field labels, so "Sink:"
+# and "Corked:" are "Destino:" / "Suspendido:" under a Spanish locale and this
+# reads them by name.
+_target_sink_inputs () {
+    local line index="" sink="" corked="" app="" in_props=0
 
     while IFS= read -r line; do
-        if [[ $line == "Sink Input #"* ]]; then
-            sink_index="${line#Sink Input #}"
-        elif [[ $line == *"application.name = "* ]]; then
-            sink_app="$(cut -d '"' -f2 <<< "$line")"
-            if is_target_sink_app "$sink_app_name" "$sink_app"; then
-                source_sink_index="$sink_index"
-                log_debug "matched target sink: $sink_app"
-                return 0
-            fi
-        fi
-    done <<< "$sink_list"
+        case "$line" in
+            "Sink Input #"*)
+                # Emit the block that just ended. The synthetic header appended
+                # to the input below flushes the last real one through here too,
+                # and emits nothing itself (its own index is empty).
+                if [[ -n "$index" && -n "$app" ]] && is_target_sink_app "$sink_app_name" "$app"; then
+                    printf '%s\t%s\t%s\n' "$index" "$sink" "$corked"
+                fi
+                index="${line#Sink Input #}"; sink=""; corked=""; app=""; in_props=0
+                ;;
+            # Everything below "Properties:" is player-supplied text, so the
+            # block's own fields are only read ABOVE it. Without this split a
+            # track called "Sink: The Movie" - media.name is the track title -
+            # rewrites the sink this stream is on, and the routing check then
+            # believes a stream it never looked at.
+            *"Properties:") in_props=1 ;;
+            *"Sink: "*)              [[ $in_props -eq 0 ]] && sink="${line##*Sink: }" ;;
+            *"Corked: "*)            [[ $in_props -eq 0 ]] && corked="${line##*Corked: }" ;;
+            *"application.name = "*)
+                # Parsed in-shell rather than through cut: this runs per
+                # property line and the routing poll runs every second.
+                app="${line#*\"}"; app="${app%\"*}"
+                ;;
+        esac
+    done < <(LC_ALL=C pactl list sink-inputs 2>/dev/null; printf 'Sink Input #\n')
 
-    return 3
+    return 0
 }
 
-ensure_target_routed () {
-    # Fast path: reuse the cached sink-input id (move-sink-input is idempotent).
-    if [[ -n "$source_sink_index" ]] \
-        && pactl move-sink-input "$source_sink_index" "$nulloutput_name" 2>/dev/null; then
-        return 0
-    fi
+# Index of the capture sink, or empty if it does not exist (yet). Resolved on
+# every call rather than cached, for the same reason source_sink_index is no
+# longer cached: a stale id here would silently compare against the wrong sink.
+_null_sink_index () {
+    LC_ALL=C pactl list short sinks 2>/dev/null \
+        | awk -v want="$nulloutput_name" '$2 == want { print $1; exit }'
+}
 
-    # Slow path: the player likely replaced its sink-input (e.g. track change).
-    # Non-fatal so a transient failure does not kill the run.
-    get_target_sink_index || return 1
-    if ! pactl move-sink-input "$source_sink_index" "$nulloutput_name" 2>/dev/null; then
-        log_line "could not move sink-input $source_sink_index to '$nulloutput_name'"
-        return 1
-    fi
+# Sets source_sink_index to the player's CURRENT stream. Returns 0 matched,
+# 1 none found.
+#
+# The NEWEST match wins. At a track boundary a player can briefly own two
+# sink-inputs - the one it is tearing down and the one it just created - and
+# taking the FIRST match in pactl order (the oldest) meant routing the corpse
+# and leaving the live stream on the speakers.
+get_target_sink_index () {
+    local idx sink corked found="" found_sink="" found_corked=""
+
+    while IFS=$'\t' read -r idx sink corked; do
+        found="$idx"; found_sink="$sink"; found_corked="$corked"
+    done < <(_target_sink_inputs)
+
+    [[ -n "$found" ]] || return 1
+    source_sink_index="$found"
+    log_debug "matched target sink-input $found (sink=$found_sink corked=$found_corked)"
     return 0
+}
+
+# Puts EVERY stream of the target player on the capture sink, and reports
+# whether at least one of them ended up there. Also sets capture_route_live,
+# which is the answer to the question the recording engine cannot ask parec:
+# is audio genuinely reaching what we are capturing?
+#
+# There is deliberately no cached "fast path" any more. The old one reused the
+# last known sink-input index and only re-detected when "pactl move-sink-input"
+# on it failed - but that move succeeds whenever ANY stream still carries that
+# index, not just the player's. A player that rebuilds its stream between
+# tracks (and PipeWire, which recycles object ids) therefore had us move a
+# stranger's stream into the capture sink while the player itself kept playing
+# to the speakers. parec reads an idle monitor as a perfectly valid stream of
+# zeroes, so the track encoded to full length with no audio in it at all, and
+# the next track change - by which time the stale index was finally gone -
+# recovered on its own. That is the "some files are pure silence, the rest are
+# fine" failure. Re-detecting costs one pactl call per track; the cache cost
+# whole tracks.
+ensure_target_routed () {
+    local idx sink corked null_idx routed=1
+
+    null_idx="$(_null_sink_index)"
+    source_sink_index=""
+    capture_route_live=false
+
+    while IFS=$'\t' read -r idx sink corked; do
+        source_sink_index="$idx"
+        if [[ -n "$null_idx" && "$sink" == "$null_idx" ]]; then
+            routed=0
+        elif pactl move-sink-input "$idx" "$nulloutput_name" 2>/dev/null; then
+            routed=0
+            log_line "routed sink-input $idx to '$nulloutput_name' (was on sink $sink)"
+        else
+            # log_debug, not log_line: this runs once a second from the capture
+            # poll, so a persistent failure would write a line per second for
+            # the length of the session. The throttled, once-per-episode report
+            # the poll itself writes is the signal; this is the detail behind
+            # it, and only at the diagnostic log level.
+            log_debug "could not move sink-input $idx to '$nulloutput_name'"
+            continue
+        fi
+        # A corked stream is attached but silent (paused, or still buffering),
+        # which is normal for a moment at a track boundary and a problem only
+        # if it lasts - poll_capture_route is what times it.
+        # shellcheck disable=SC2034  # capture_route_live is read by the active profile module's capture-route poll
+        [[ "$corked" == "yes" ]] || capture_route_live=true
+    done < <(_target_sink_inputs)
+
+    return $routed
 }
 
 # Module ids of every loaded module-null-sink whose sink_name is exactly
@@ -1717,8 +1881,8 @@ create_null_audio_output () {
 }
 
 move_target_output () {
-    if ! pactl move-sink-input "$source_sink_index" "$nulloutput_name" 2>/dev/null; then
-        printf 'FATAL: %s\n' "$(t err.cannot_move_sink_input "$source_sink_index" "$nulloutput_name")" >&2
+    if ! ensure_target_routed; then
+        printf 'FATAL: %s\n' "$(t err.cannot_move_sink_input "${source_sink_index:--}" "$nulloutput_name")" >&2
         exit 1
     fi
 }
@@ -1887,13 +2051,18 @@ file_path_structure () {
             ;;
         stream)
             # Flat single-folder layout for an online-radio capture: every file
-            # lands directly in the session dir as "artist_title". The album is
-            # deliberately omitted. The two parts are joined FIRST and the whole
-            # basename capped, since two individually-legal parts can still add
+            # lands directly in the session dir as "NNNN_artist_title". The album
+            # is deliberately omitted. The three parts are joined FIRST and the
+            # whole basename capped, since individually-legal parts can still add
             # up to one illegally long file name - here they are one name, not
-            # two. First artist only, like every other scheme.
+            # three. First artist only, like every other scheme.
+            #
+            # The counter prefix is what makes a flat folder readable: sorted by
+            # name, the session replays in capture order, so it lines up with the
+            # source playlist and a session that was cut off shows exactly where.
+            # It sits at the FRONT, so it is never what the cap truncates.
             outdir="$session_output_directory"
-            outfile="$(_portable_component "$(sanitize_str "strict-lc" "$i_artist")_$(sanitize_str "strict-lc" "$i_title")").$extension"
+            outfile="$(_portable_component "$(printf '%04d' "$stream_counter")_$(sanitize_str "strict-lc" "$i_artist")_$(sanitize_str "strict-lc" "$i_title")").$extension"
             ;;
         *)
             # Unreachable: filename_scheme is validated at startup.
@@ -2013,11 +2182,20 @@ start_recording () {
     finalfile="$(file_path_structure "$i_artist" "$i_album" "$i_title" "$ext")"
     stop_current_recording
 
-    if ! ensure_target_routed; then
-        recording_failed=true; status_dirty=1
-        log_line "could not route target sink to monitor output"
-        return 1
-    fi
+    # Routing is retried briefly instead of attempted once. At a track change
+    # the player can be between streams for a moment (it tears the old one down
+    # before creating the next), and a single attempt landing in that gap used
+    # to abandon the whole track.
+    local route_try=0
+    until ensure_target_routed; do
+        route_try=$((route_try + 1))
+        if [[ $route_try -ge 5 ]]; then
+            recording_failed=true; status_dirty=1
+            log_line "could not route target sink to monitor output"
+            return 1
+        fi
+        sleep 0.2
+    done
 
     record_error_log="$(mktemp)"
     record_fifo_dir="$(mktemp -d)"
@@ -2104,6 +2282,12 @@ start_recording () {
     record_log_tracknumber="$i_tracknumber"
     record_log_discnumber="$i_discnumber"
     record_log_file="$finalfile"
+    # Advanced only here, at the single point where a capture is declared
+    # started: a track that failed to start reuses its number instead of
+    # leaving a hole in the sequence. Advanced unconditionally - only the
+    # "stream" scheme reads it, and a counter that tracks captures either way
+    # is easier to reason about than one that starts and stops.
+    stream_counter=$((stream_counter + 1))
     return 0
 }
 
