@@ -179,8 +179,9 @@ test_strict_schemes_fall_back_when_metadata_has_no_ascii () {
     })"
     rm -rf "$tmpdir"
 
-    # stream drops the album, so only artist+title fall back (two parts, not three).
-    [[ "$out" == "/Unknown/Unknown/Unknown.m4a|/unknown_unknown.m4a" ]]
+    # stream drops the album, so only artist+title fall back (two parts, not
+    # three), behind the capture-order counter every stream name carries.
+    [[ "$out" == "/Unknown/Unknown/Unknown.m4a|/0001_unknown_unknown.m4a" ]]
 }
 
 test_stream_scheme_drops_album () {
@@ -194,8 +195,62 @@ test_stream_scheme_drops_album () {
     })"
     rm -rf "$tmpdir"
 
-    # Flat, lowercased, album omitted, no artist/album subdirs.
-    [[ "$out" == "$tmpdir/artist_song.m4a" ]]
+    # Flat, lowercased, album omitted, no artist/album subdirs, capture number
+    # in front.
+    [[ "$out" == "$tmpdir/0001_artist_song.m4a" ]]
+}
+
+# The whole numbering contract in one fixture: the counter starts where
+# stream_start_number says, advances ONLY when a capture really started (a run
+# that fails to route reuses its number instead of leaving a hole), and the
+# number leads the flat name so the folder sorts back into capture order.
+test_stream_scheme_numbers_files_in_capture_order () {
+    local out tmpdir
+    tmpdir="$(mktemp -d)"
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        # Long enough to outlive start_recording's own 0.2s liveness check,
+        # short enough not to hold the command substitution open: these stubs
+        # inherit its stdout, so "$( )" does not close until they exit.
+        # shellcheck disable=SC2317
+        oggenc () { sleep 1; }
+        # shellcheck disable=SC2317
+        parec () { sleep 1; }
+        rec_temp_dir="$tmpdir/rectmp"; mkdir -p "$rec_temp_dir"
+        session_output_directory="$tmpdir"
+        record_format="ogg"
+        filename_scheme="stream"
+        stream_start_number=501
+        init_session_log
+
+        # shellcheck disable=SC2317
+        ensure_target_routed () { return 0; }
+        start_recording "Artist" "Album" "First" "Artist" "1" "1" >/dev/null 2>&1
+        printf '%s ' "$(basename "$record_log_file")"
+
+        # A failed start must not consume a number.
+        # shellcheck disable=SC2317
+        ensure_target_routed () { return 1; }
+        start_recording "Artist" "Album" "Lost" "Artist" "2" "1" >/dev/null 2>&1
+
+        # shellcheck disable=SC2317
+        ensure_target_routed () { return 0; }
+        start_recording "Artist" "Album" "Second" "Artist" "3" "1" >/dev/null 2>&1
+        printf '%s' "$(basename "$record_log_file")"
+    })"
+    rm -rf "$tmpdir"
+
+    [[ "$out" == "0501_artist_first.oga 0502_artist_second.oga" ]]
+}
+
+# A capture session is long and unattended; the log is the only thing that can
+# explain afterwards what happened, so it has to be on without being asked for.
+test_default_log_level_is_1 () {
+    local out
+    out="$({ source "$SCRIPT_PATH"; printf '%s' "$log_level"; })"
+
+    [[ "$out" == "1" ]]
 }
 
 test_default_filename_scheme_is_stream () {
@@ -534,7 +589,10 @@ test_start_recording_captures_to_temp_not_final () {
         # Encoder writes to the temp file under rec_temp_dir; nothing has landed
         # at the final destination yet (the move happens only on finalize).
         [[ "$oarg" == "$record_temp_file" && "$record_temp_file" == "$rec_temp_dir"/* ]] && printf 'TEMP '
-        [[ -e "$session_output_directory/Artist/Album/Song.oga" ]] && printf 'FINAL_EXISTS'
+        # Nothing has landed at the final destination yet, whatever the active
+        # scheme names it - checked by listing the session dir rather than
+        # probing one scheme's path, which would pass vacuously under another.
+        [[ -n "$(find "$session_output_directory" -type f -name '*.oga' 2>/dev/null)" ]] && printf 'FINAL_EXISTS'
     })"
     rm -rf "$tmpdir"
 
@@ -745,6 +803,100 @@ test_load_config_seeds_the_modules_config_section () {
     [[ "$out" == "1:spotify" ]]
 }
 
+# The regression guard for the seeding rule. load_config used to reseed the
+# WHOLE module section the moment a single schema key was missing, so the first
+# launch after a module grew a field silently reset every setting the user had
+# customised - manage_player included, which would have flipped an attached-mode
+# user back into managed mode mid-project. Only the missing key may be filled.
+test_load_config_fills_only_missing_module_keys () {
+    local out cfg
+    cfg="$(mktemp)"
+    {
+        printf 'default_profile="spotify_native"\nenabled_profiles="spotify_native"\n'
+        printf 'spotify_native_manage_player="no"\n'
+        printf 'spotify_native_sink_app_name="mine"\n'
+        printf 'spotify_native_mpris_bus="org.example.Bus"\n'
+        printf 'spotify_native_mpris_wait_timeout_seconds="42"\n'
+        printf 'spotify_native_sink_match="mine mine*"\n'
+    } > "$cfg"
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        config_path="$cfg"
+        load_config
+        printf '%s:%s:%s:%s:%s' \
+            "$spotify_native_manage_player" \
+            "$spotify_native_sink_app_name" \
+            "$spotify_native_mpris_wait_timeout_seconds" \
+            "$spotify_native_stream_start_number" \
+            "$(( $(grep -c '^spotify_native_' "$cfg") == $(_profile_schema_keys | wc -l) ? 1 : 0 ))"
+        # A schema default is one tab-separated field, and an empty one must
+        # stay empty: a tab is IFS whitespace, so reading the row with
+        # "IFS=$'\t' read -r key label default" collapses a run of tabs and
+        # shifts the kind into the default's place.
+        profile_config_schema () {
+            printf 'demo_spaced\tLabel\tspotify spotify*\tinput\n'
+            printf 'demo_empty\tLabel\t\tinput\n'
+        }
+        _seed_missing_profile_keys demo_spaced demo_empty
+        printf ':%s:%s' "$demo_spaced" "$demo_empty"
+    })"
+    rm -f "$cfg"
+
+    [[ "$out" == "no:mine:42:1:1:spotify spotify*:" ]]
+}
+
+# A field a module says does not apply is hidden from the Profile Settings menu
+# but stays in the schema, so it is still seeded, saved and validated. The
+# filter lives in _profile_schema_rows precisely so all four parallel arrays
+# shrink together - filtering when the menu is built instead would shift the
+# index dispatch and edit a different field than the one selected.
+test_profile_field_visible_hides_the_row_but_keeps_the_key () {
+    local out
+    out="$({
+        source_with_spotify_native
+        profile_apply_defaults
+        _show () {
+            spotify_native_manage_player="$1"; filename_scheme="$2"
+            _profile_schema_rows
+            printf '%s%s ' \
+                "$(printf '%s\n' "${schema_keys[@]}" | grep -c '^spotify_native_stream_start_number$')" \
+                "$(( ${#schema_keys[@]} == ${#schema_labels[@]} \
+                  && ${#schema_keys[@]} == ${#schema_kinds[@]} \
+                  && ${#schema_keys[@]} == ${#schema_choices[@]} ? 0 : 9 ))"
+        }
+        _show no stream; _show yes stream; _show no normal; _show yes normal
+        # Hidden or not, save_config still persists it.
+        printf '%s' "$(_profile_schema_keys | grep -c '^spotify_native_stream_start_number$')"
+    })"
+
+    [[ "$out" == "10 00 00 00 1" ]]
+}
+
+# The start number reaches printf '%04d', where bash reads a leading zero as
+# octal ("0050" would number the first file 0040 and "0090" is not even valid
+# octal), so profile_activate normalises it with 10# and falls back to 1 for
+# anything outside 1-9999. Managed mode always starts at 1: loopcatcher opens
+# the playlist itself, from the top.
+test_stream_start_number_is_normalised_per_capture_mode () {
+    local out
+    out="$({
+        source_with_spotify_native
+        profile_apply_defaults
+        _seed () {
+            spotify_native_manage_player="$1"; spotify_native_stream_start_number="$2"
+            profile_activate
+            printf '%s ' "$stream_start_number"
+        }
+        _seed no 0050; _seed no 9999; _seed yes 50; _seed no 0; _seed no 12000; _seed no abc
+        # And an out-of-range value is reported, not silently swallowed.
+        spotify_native_stream_start_number="12000"
+        printf '%s' "$(profile_validate_settings >/dev/null && echo accepted || echo rejected)"
+    })"
+
+    [[ "$out" == "50 9999 1 1 1 1 rejected" ]]
+}
+
 test_save_config_preserves_inactive_module_lines () {
     local out cfg
     cfg="$(mktemp)"
@@ -801,6 +953,124 @@ test_is_target_sink_app_profile_driven () {
     })"
 
     [[ "$out" == "acme-yes spotify-no" ]]
+}
+
+# The routing bug that recorded whole tracks as digital silence: the old
+# ensure_target_routed reused a cached sink-input index and only re-detected
+# when moving it failed - which it does not, when some OTHER stream has
+# inherited that index. One fixture asserts the whole replacement contract:
+# the stale index is never used, every stream of the player is routed (not just
+# the first match), a stream already on the capture sink is left alone, another
+# application's stream is never touched, and capture_route_live reports that
+# audio can genuinely reach the capture sink.
+# pactl's sink-input blocks put the player's OWN text under "Properties:", and
+# media.name is the track title. A title like "Sink: The Movie" used to be read
+# as the block's Sink field, so the routing check believed a stream it had never
+# looked at. Block fields are read above Properties only. Same fixture also
+# covers a stream with no application.name at all (skipped, not crashed) and
+# confirms the newest match is the one reported.
+test_target_sink_inputs_reads_block_fields_not_property_text () {
+    local out
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        sink_app_name="spotify"
+        player_sink_match="spotify spotify*"
+        # shellcheck disable=SC2317
+        pactl () {
+            printf 'Sink Input #61\n\tSink: 3\n\tCorked: no\n\tSink Latency: 21333 usec\n\tProperties:\n'
+            printf '\t\tmedia.name = "Sink: The Movie"\n\t\tapplication.process.id = "4821"\n'
+            printf 'Sink Input #62\n\tSink: 3\n\tCorked: yes\n\tProperties:\n'
+            printf '\t\tapplication.name = "Spotify"\n\t\tmedia.name = "Corked: no"\n'
+            printf 'Sink Input #63\n\tSink: 7\n\tCorked: no\n\tProperties:\n\t\tapplication.name = "spotify"\n'
+        }
+        _target_sink_inputs | tr '\t' ',' | tr '\n' ' '
+        get_target_sink_index && printf 'newest=%s' "$source_sink_index"
+    })"
+
+    # 61 has no application.name, so it is not ours; 62 stays corked despite a
+    # track title that says otherwise; 63 keeps the sink its own field declares.
+    [[ "$out" == "62,3,yes 63,7,no newest=63" ]]
+}
+
+test_routing_moves_every_player_stream_and_ignores_a_stale_index () {
+    local out moves
+    moves="$(mktemp)"
+    # shellcheck disable=SC2034
+    out="$({
+        source "$SCRIPT_PATH"
+        nulloutput_name="loopcatcher"
+        sink_app_name="spotify"
+        player_sink_match="spotify spotify*"
+        source_sink_index="99"        # stale: belongs to a stream long gone
+        # shellcheck disable=SC2317
+        pactl () {
+            case "$1 $2" in
+                "list short")
+                    printf '3\talsa_output.pci\tmodule-alsa-card\ts16le 2ch 48000Hz\tRUNNING\n'
+                    printf '7\tloopcatcher\tmodule-null-sink\ts16le 2ch 44100Hz\tIDLE\n'
+                    ;;
+                "list sink-inputs")
+                    printf 'Sink Input #10\n\tSink: 3\n\tCorked: no\n\tProperties:\n\t\tapplication.name = "Chromium"\n'
+                    printf 'Sink Input #11\n\tSink: 3\n\tCorked: yes\n\tProperties:\n\t\tapplication.name = "spotify"\n'
+                    printf 'Sink Input #12\n\tSink: 7\n\tCorked: no\n\tProperties:\n\t\tapplication.name = "Spotify"\n'
+                    ;;
+                "move-sink-input"*) printf 'moved=%s ' "$2" >> "$moves" ;;
+            esac
+            return 0
+        }
+        ensure_target_routed
+        printf 'rc=%s index=%s live=%s ' "$?" "$source_sink_index" "$capture_route_live"
+        cat "$moves"
+    })"
+    rm -f "$moves"
+
+    [[ "$out" == "rc=0 index=12 live=true moved=11 " ]]
+}
+
+# The other half of the same fix: when the player's stream is NOT on the
+# capture sink and cannot be moved there, parec still reads a valid,
+# full-length stream of zeroes off the idle monitor - so the only way the
+# session can ever know is this flag. poll_capture_route turns it into exactly
+# one log line per episode, after three consecutive polls (a stream is
+# legitimately corked for a moment at every track boundary).
+test_capture_route_poll_logs_silence_once_per_episode () {
+    local out base
+    base="$(mktemp -d)"
+    # shellcheck disable=SC2034
+    out="$({
+        source_with_spotify_native
+        log_level=1
+        log_file_path="$base/session.log"
+        session_name="mysession"
+        init_session_log
+        nulloutput_name="loopcatcher"
+        sink_app_name="spotify"
+        player_sink_match="spotify spotify*"
+        active_recording_signature="track:1"
+        title="Enter Sandman"
+        # shellcheck disable=SC2317
+        pactl () {
+            case "$1 $2" in
+                "list short") printf '7\tloopcatcher\tmodule-null-sink\ts16le 2ch 44100Hz\tIDLE\n' ;;
+                "list sink-inputs")
+                    printf 'Sink Input #11\n\tSink: 3\n\tCorked: no\n\tProperties:\n\t\tapplication.name = "spotify"\n'
+                    ;;
+                "move-sink-input"*) return 1 ;;
+            esac
+            return 0
+        }
+        poll_capture_route; poll_capture_route; poll_capture_route; poll_capture_route
+        printf 'warned=%s ' "$(grep -c 'capturing silence' "$session_log_path")"
+        # Nothing is recording: the poll must stay out of the way entirely.
+        active_recording_signature=""
+        capture_silent_polls=0
+        poll_capture_route
+        printf 'idle=%s' "$capture_silent_polls"
+    })"
+    rm -rf "$base"
+
+    [[ "$out" == "warned=1 idle=0" ]]
 }
 
 # Counts every persisted generic + active-module key rather than naming a
@@ -1393,6 +1663,8 @@ main () {
     run_test test_maybe_start_recording_waits_for_full_metadata_burst
     run_test test_strict_schemes_fall_back_when_metadata_has_no_ascii
     run_test test_stream_scheme_drops_album
+    run_test test_stream_scheme_numbers_files_in_capture_order
+    run_test test_default_log_level_is_1
     run_test test_default_filename_scheme_is_stream
     run_test test_portable_component_caps_length_and_reserved_names
     run_test test_portable_component_respects_byte_limit
@@ -1413,9 +1685,15 @@ main () {
     run_test test_load_config_enables_all_modules_on_fresh_config
     run_test test_manage_player_flag_selects_the_capture_mode
     run_test test_load_config_seeds_the_modules_config_section
+    run_test test_load_config_fills_only_missing_module_keys
+    run_test test_profile_field_visible_hides_the_row_but_keeps_the_key
+    run_test test_stream_start_number_is_normalised_per_capture_mode
     run_test test_save_config_preserves_inactive_module_lines
     run_test test_enabled_profiles_always_includes_default_profile
     run_test test_is_target_sink_app_profile_driven
+    run_test test_target_sink_inputs_reads_block_fields_not_property_text
+    run_test test_routing_moves_every_player_stream_and_ignores_a_stale_index
+    run_test test_capture_route_poll_logs_silence_once_per_episode
     run_test test_validate_settings_rejects_every_invalid_field
     run_test test_save_config_persists_all_fields
     run_test test_effective_log_file_path_default_and_override

@@ -16,8 +16,9 @@ reports.
 - **One file per track**, split automatically — never one long recording.
 - **Tagged as it records**: artist, album, album artist, title, track/disc
   number written into the file itself.
-- **Flexible output layout**: a flat `Music/<session>/artist_title.m4a` by
-  default, or a browsable `Artist/Album/Title` tree — your pick (see
+- **Flexible output layout**: a flat, numbered
+  `Music/<session>/0001_artist_title.m4a` by default, or a browsable
+  `Artist/Album/Title` tree — your pick (see
   [Filename scheme](#filename-scheme)).
 - **AAC (`.m4a`) or OGG (`.oga`)**, bitrate and AAC profile of your choosing.
 - **Fully interactive** — a guided flow, no flags to memorize.
@@ -135,8 +136,11 @@ edited by hand too. Settings and Profile Settings changes take effect via
 
 A per-session log is written to `${TMPDIR:-/tmp}/loopcatcher/<session>.log`
 (or wherever `log_file_path` points), listing every captured track with its
-metadata and how long it took to record. Set `log_level` to `0` to turn it
-off, or `2` to add encoder diagnostics.
+metadata and how long it took to record, plus a warning if audio ever stops
+reaching the capture sink. It is on by default — a long capture usually runs
+unattended, and the log is the only thing that can tell you afterwards what
+happened. Set `log_level` to `0` to turn it off, or `2` to add encoder
+diagnostics.
 
 ### Command line
 
@@ -198,8 +202,18 @@ How each track is named and laid out on disk is set in Settings →
 
 - **Stream Collection** *(default)* — a flat, single-folder layout meant for
   online-radio style captures: every track lands directly in the session folder
-  as `artist_title`, lower-cased and reduced to plain ASCII. No per-artist or
-  per-album subfolders, and the album is left out of the name.
+  as `0001_artist_title`, lower-cased and reduced to plain ASCII. No per-artist
+  or per-album subfolders, and the album is left out of the name.
+
+  The four-digit counter is what makes a single folder readable: sorted by
+  name, the session plays back in the order it was captured, so it lines up
+  with the playlist you recorded and a run that got cut off shows you exactly
+  where it stopped. Numbering restarts at `0001` for each session — unless you
+  are picking up where an interrupted run left off, in which case set
+  **Profile → Profile Settings → Start numbering from** to the number to
+  continue from (1–9999). That setting only appears when loopcatcher is *not*
+  driving the player itself, since in that mode it always opens the playlist
+  from the top.
 - **Music Collection** — a browsable `Artist/Album/Title` tree that keeps the
   original names (accents and non-Latin scripts intact).
 - **Music Collection with sanitized names** — the same `Artist/Album/Title`

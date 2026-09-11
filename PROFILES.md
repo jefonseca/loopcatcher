@@ -55,7 +55,8 @@ list further down).
 ## The seven functions LoopCatcher expects from you
 
 This is the whole contract. Define these seven functions and your profile
-is a profile.
+is a profile. There are two more further down that are entirely optional —
+skip them and nothing changes.
 
 ### `profile_label()`
 
@@ -112,11 +113,20 @@ profile_apply_defaults () {
 }
 ```
 
-This runs exactly once per profile: the first time a user ever selects it.
-LoopCatcher checks whether any of your schema's keys already exist in the
-saved config — if none do, it calls this function and immediately writes
-the result to disk, so from then on your profile's settings are just sitting
-in the config file like everyone else's.
+This runs once per profile: the first time a user ever selects it.
+LoopCatcher checks which of your schema's keys already exist in the saved
+config — if *none* do, it calls this function and immediately writes the
+result to disk, so from then on your profile's settings are just sitting in
+the config file like everyone else's.
+
+If only *some* are missing — because you added a field to your schema after
+people were already using your profile — LoopCatcher fills in just those,
+straight from the `default` column of your schema, and leaves everything else
+alone. It deliberately does **not** call `profile_apply_defaults` in that
+case: that function resets *everything*, so using it here would quietly throw
+away every setting your users had customised the first time they launched a
+newer build. Which is why the `default` column has to match what this
+function assigns — they are the same values, read by two different paths.
 
 **One important rule:** don't give your variables a fallback default at the
 top of `profile.sh` (no `your_profile_name_sink_app_name="${your_profile_name_sink_app_name:-vlc}"`
@@ -259,6 +269,54 @@ profile_cleanup () {
 }
 ```
 
+## Two optional hooks
+
+Neither is required. Define one only if you need what it does.
+
+### `profile_field_visible(key)`
+
+Called for each of your schema's keys as the Profile Settings menu is drawn.
+Return 0 to show the field, non-zero to hide it, and **0 for any key you
+don't recognise**. Use it for a setting that only makes sense under some
+other setting:
+
+```bash
+profile_field_visible () {
+    case "$1" in
+        your_profile_name_start_number)
+            [[ "$your_profile_name_mode" == "manual" && "$filename_scheme" == "stream" ]] ;;
+        *) return 0 ;;
+    esac
+}
+```
+
+Hiding a row hides *only the row*. The key stays in your schema, so it is
+still seeded, still validated, and still written to the config file — a
+hidden setting keeps its value rather than disappearing.
+
+### `profile_validate_settings()`
+
+LoopCatcher validates its own settings, but it knows nothing about yours.
+Define this and it gets called as part of that same check — at startup, and
+again every time the user edits any setting, which is what makes the editor
+re-prompt instead of accepting a bad value. Print the problem and return
+non-zero, exactly like LoopCatcher's own checks:
+
+```bash
+profile_validate_settings () {
+    if [[ ! "$your_profile_name_start_number" =~ ^[0-9]+$ ]]; then
+        t your_profile_name.error.invalid_start_number "$your_profile_name_start_number"
+        return 1
+    fi
+    return 0
+}
+```
+
+Careful with numbers the user typed: bash reads a leading zero as octal in
+arithmetic, so `0050` is 40 and `0090` is an error. Normalise with `10#` —
+and check the value is all digits *first*, because `$((10#abc))` is a hard
+error, not a fallback.
+
 ## What LoopCatcher gives you to build with
 
 Your profile doesn't have to build a TUI from scratch or reimplement audio
@@ -284,8 +342,9 @@ routing. All of the following are already there, ready to call:
 
 You'll also find a handful of read-only variables already populated for
 you when `profile_run` starts: `output_directory`, `session_name`,
-`session_output_directory`, `config_path`, `nulloutput_name`, and
-`artist_all` (an array — leave it empty if your player only ever reports one
+`session_output_directory`, `config_path`, `nulloutput_name`,
+`filename_scheme` (the layout the user picked — `normal`, `strict` or
+`stream`), and `artist_all` (an array — leave it empty if your player only ever reports one
 artist per track; LoopCatcher's tagging code already handles that case).
 
 ## Strings and translations
@@ -425,7 +484,7 @@ targeting. There's no substitute for watching it capture a real track.
 ## Checklist
 
 - [ ] `profiles/your_profile_name/profile.sh` defines all seven hook
-      functions
+      functions (the two optional ones only if you need them)
 - [ ] No config variable is self-defaulted at the top of `profile.sh`
 - [ ] `profiles/your_profile_name/lang/en.sh` has an entry for every id you
       call `t` with

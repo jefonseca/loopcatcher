@@ -51,6 +51,16 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.4.1" date="2026-09-11">
+      <description>
+        <p>Fixes long sessions silently capturing digital silence when the
+        player's audio stream was rebuilt mid-track, by re-checking routing
+        every second instead of only at track changes. "Stream Collection"
+        files are now numbered in capture order, with a new "Start numbering
+        from" setting to resume an interrupted session. Session logging is
+        on by default.</p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-09-07">
       <description>
         <p>Recording is never done in place any more: each track is captured
